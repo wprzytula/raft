@@ -14,6 +14,16 @@ use assignment_3_solution::{
 use assignment_3_test_utils::distributed_set::{DistributedSet, SetOperation, SetResponse};
 use assignment_3_test_utils::{singleton_range, ExecutorSender, RamStorage};
 
+fn logger_init() {
+    if let Err(_) = env_logger::builder()
+        .format_timestamp(None)
+        .filter_level(log::LevelFilter::Debug)
+        // .is_test(true)
+        .try_init() {
+        println!("Couldn't init logger")
+    };
+}
+
 #[tokio::test]
 #[timeout(1000)]
 async fn can_remove_from_set() {

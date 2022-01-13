@@ -3,15 +3,25 @@ use std::time::{Duration, SystemTime};
 use async_channel::unbounded;
 use ntest::timeout;
 use uuid::Uuid;
-
 use executor::System;
 
 use assignment_3_solution::*;
 use assignment_3_test_utils::*;
 
+fn logger_init() {
+    if let Err(_) = env_logger::builder()
+        .format_timestamp(None)
+        .filter_level(log::LevelFilter::Debug)
+        // .is_test(true)
+        .try_init() {
+        println!("Couldn't init logger")
+    };
+}
+
 #[tokio::test]
 #[timeout(1000)]
 async fn system_makes_progress_when_there_is_a_majority() {
+    logger_init();
     // given
     let mut system = System::new().await;
 
@@ -75,6 +85,7 @@ async fn system_makes_progress_when_there_is_a_majority() {
 #[tokio::test]
 #[timeout(1500)]
 async fn system_does_not_make_progress_without_majority() {
+    logger_init();
     // given
     let mut system = System::new().await;
 
@@ -145,6 +156,7 @@ async fn system_does_not_make_progress_without_majority() {
 #[tokio::test]
 #[timeout(1500)]
 async fn follower_denies_vote_for_candidate_with_outdated_log() {
+    logger_init();
     // given
     let mut system = System::new().await;
 
@@ -281,6 +293,7 @@ async fn follower_denies_vote_for_candidate_with_outdated_log() {
 #[tokio::test]
 #[timeout(500)]
 async fn follower_rejects_inconsistent_append_entry() {
+    logger_init();
     // given
     let mut system = System::new().await;
 
@@ -395,6 +408,7 @@ async fn follower_rejects_inconsistent_append_entry() {
 #[tokio::test]
 #[timeout(500)]
 async fn follower_redirects_to_leader() {
+    logger_init();
     // given
     let mut system = System::new().await;
     let leader_id = Uuid::new_v4();
@@ -481,6 +495,7 @@ async fn follower_redirects_to_leader() {
 #[tokio::test]
 #[timeout(500)]
 async fn leader_steps_down_without_heartbeat_responses_from_majority() {
+    logger_init();
     let mut system = System::new().await;
     let leader_id = Uuid::new_v4();
     let follower_id = Uuid::new_v4();
@@ -569,6 +584,7 @@ async fn leader_steps_down_without_heartbeat_responses_from_majority() {
 #[tokio::test]
 #[timeout(1000)]
 async fn follower_ignores_request_vote_within_election_timeout_of_leader_heartbeat() {
+    logger_init();
     // given
     let mut system = System::new().await;
     let leader_id = Uuid::new_v4();
