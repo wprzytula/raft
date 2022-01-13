@@ -14,11 +14,11 @@ fn logger_init() {
         .format_timestamp(None)
         .filter_level(log::LevelFilter::Debug)
         // .is_test(true)
-        .try_init() {
+        .try_init()
+    {
         println!("Couldn't init logger")
     };
 }
-
 
 #[tokio::test]
 #[timeout(1000)]

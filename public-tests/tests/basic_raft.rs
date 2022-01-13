@@ -1,9 +1,9 @@
 use std::time::{Duration, SystemTime};
 
 use async_channel::unbounded;
+use executor::System;
 use ntest::timeout;
 use uuid::Uuid;
-use executor::System;
 
 use assignment_3_solution::*;
 use assignment_3_test_utils::*;
@@ -13,13 +13,14 @@ fn logger_init() {
         .format_timestamp(None)
         .filter_level(log::LevelFilter::Debug)
         // .is_test(true)
-        .try_init() {
+        .try_init()
+    {
         println!("Couldn't init logger")
     };
 }
 
 #[tokio::test]
-#[timeout(1000)]
+#[timeout(400)]
 async fn system_makes_progress_when_there_is_a_majority() {
     logger_init();
     // given

@@ -10,7 +10,7 @@ use rand::distributions::{Distribution, Uniform};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::LogEntryContent::Configuration;
+use crate::ClientRequestResponse::RegisterClientResponse;
 use crate::ProcessType::{Candidate, Leader};
 pub use domain::*;
 
@@ -66,7 +66,7 @@ where
     }
 
     pub fn reset_timer(&mut self, raft_ref: ModuleRef<Raft>, interval: Duration) {
-        log::debug!("Timer set to {:?}", interval);
+        // log::debug!("Timer set to {:?}", interval);
         self.timer_abort.store(true, Ordering::Relaxed);
         self.timer_abort = Arc::new(AtomicBool::new(false));
         tokio::spawn(Self::run_timer(
@@ -105,6 +105,8 @@ enum ProcessType {
         match_index: HashMap<Uuid, usize>,
         heartbeat_timer: Timer<HeartbeatTimeout>,
         responses_collected_during_this_election: HashSet<Uuid>,
+        // Where the response should be sent after commiting key-th log entry:
+        client_senders: HashMap<usize, Sender<ClientRequestResponse>>,
     },
 }
 
@@ -133,6 +135,7 @@ impl ProcessType {
             match_index,
             heartbeat_timer,
             responses_collected_during_this_election: Default::default(),
+            client_senders: Default::default(),
         }
     }
 }
@@ -145,7 +148,7 @@ impl Default for ProcessType {
 
 /// Persistent state of a Raft process.
 /// It shall be kept in stable storage, and updated before replying to messages.
-#[derive(/*Clone, */ Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct PersistentState {
     /// Number of the current term. `0` at boot.
     pub current_term: u64,
@@ -192,7 +195,7 @@ pub struct Raft {
     election_timer: Timer<ElectionTimeout>,
     election_timeout_randomizer: Uniform<Duration>,
     voting_reluctance_timer: Timer<VotingReluctanceTimeout>,
-    client_senders: HashMap<Uuid, Sender<ClientRequestResponse>>, // TODO you can add fields to this struct.
+    // TODO you can add fields to this struct.
 }
 
 impl Raft {
@@ -229,7 +232,6 @@ impl Raft {
                     election_timeout_range.end(),
                 ),
                 voting_reluctance_timer: Timer::new(),
-                client_senders: Default::default(),
             })
             .await;
         self_ref
@@ -252,6 +254,10 @@ impl Raft {
     }
 
     fn reset_voting_reluctance_timer(&mut self) {
+        log::debug!(
+            "{}: resetting voting reluctance timer!",
+            self.config.self_id
+        );
         self.voting_reluctance_timer.reset_timer(
             self.self_ref.clone().unwrap(),
             *self.config.election_timeout_range.start(),
@@ -259,6 +265,7 @@ impl Raft {
     }
 
     fn reset_election_timer(&mut self) {
+        log::debug!("{}: resetting election timer!", self.config.self_id);
         self.election_timer.reset_timer(
             self.self_ref.clone().unwrap(),
             self.election_timeout_randomizer
@@ -267,6 +274,12 @@ impl Raft {
     }
 
     async fn send_msg_to(&self, target: &Uuid, content: RaftMessageContent) {
+        log::debug!(
+            "{}: sending message to {}: {:?}!",
+            self.config.self_id,
+            target,
+            content
+        );
         self.message_sender
             .send(
                 target,
@@ -308,16 +321,14 @@ impl Raft {
             .unwrap();
     }
 
-    fn put_into_log(&mut self, entry_content: LogEntryContent) {
-        self.persistent_state.log.push(LogEntry{
-            content: LogEntryContent::RegisterClient,
-            term: self.persistent_state.current_term,
-            timestamp: SystemTime::now()
-        });
-    }
-
     /// Common message processing.
     fn msg_received(&mut self, msg: &RaftMessage) {
+        log::debug!(
+            "{}: received message from {}: {:?}!",
+            self.config.self_id,
+            msg.header.source,
+            msg.content
+        );
         if msg.header.term > self.persistent_state.current_term {
             self.update_term(msg.header.term);
             self.volatile_state.process_type = ProcessType::Follower;
@@ -354,7 +365,8 @@ impl Raft {
         match_index: &HashMap<Uuid, usize>,
         next_index: &HashMap<Uuid, usize>,
     ) {
-        for server in match_index.keys() {
+        log::debug!("{}: is replicating log!", self.config.self_id);
+        for server in match_index.keys().filter(|&x| *x != self.config.self_id) {
             // TODO: to filter self or not?
             let prev_log_index = next_index[server] - 1;
             self.send_msg_to(
@@ -367,9 +379,7 @@ impl Raft {
                             self.persistent_state.log.len(),
                             prev_log_index + self.config.append_entries_batch_size,
                         ))]
-                        .iter()
-                        .cloned()
-                        .collect(),
+                        .to_vec(),
                     leader_commit: self.volatile_state.commit_index,
                 }),
             )
@@ -407,7 +417,7 @@ impl Raft {
                 ),
             };
 
-            log::debug!("{}: was elected leader!", self.config.self_id);
+            log::info!("{}: was elected leader!", self.config.self_id);
         }
     }
 
@@ -416,12 +426,19 @@ impl Raft {
             ProcessType::Leader {
                 ref match_index, ..
             } => {
-                for i in self.volatile_state.commit_index..self.persistent_state.log.len() {
+                for i in (self.volatile_state.commit_index + 1)..self.persistent_state.log.len() {
                     if match_index.values().filter(|&val| *val >= i).count()
                         > self.config.servers.len() / 2
                     {
+                        log::info!("{}: commited entry {}.", self.config.self_id, i);
                         self.volatile_state.commit_index = i;
                     } else {
+                        log::warn!(
+                            "{}: can't commit entry {}. ({:?})",
+                            self.config.self_id,
+                            i,
+                            match_index
+                        );
                         break; // TODO: think about removing this `else`
                     }
                 }
@@ -433,17 +450,66 @@ impl Raft {
     async fn try_apply(&mut self) {
         while self.volatile_state.commit_index > self.volatile_state.last_applied {
             self.volatile_state.last_applied += 1;
-            match self.persistent_state.log[self.volatile_state.last_applied].content {
-                LogEntryContent::Command { ref data, .. } => {
-                    self.state_machine.apply(data.as_slice()).await;
+            let currently_applied_idx = self.volatile_state.last_applied;
+            let newly_commited_entry = &self.persistent_state.log[currently_applied_idx];
+            match newly_commited_entry.content {
+                LogEntryContent::Command {
+                    ref data,
+                    client_id,
+                    sequence_num,
+                    ..
+                } => {
+                    let output = self.state_machine.apply(data.as_slice()).await;
+                    if let Leader {
+                        ref mut client_senders,
+                        ..
+                    } = self.volatile_state.process_type
+                    {
+                        if let Some(client) = client_senders.get_mut(&currently_applied_idx).take()
+                        {
+                            let _ = client
+                                .send(ClientRequestResponse::CommandResponse(
+                                    CommandResponseArgs {
+                                        client_id,
+                                        sequence_num,
+                                        content: CommandResponseContent::CommandApplied { output },
+                                    },
+                                ))
+                                .await;
+                        }
+                    }
                 }
                 LogEntryContent::Configuration { .. } => {
                     unimplemented!()
                 }
                 LogEntryContent::RegisterClient => {
-                    unimplemented!()
+                    if let Leader {
+                        ref mut client_senders,
+                        ..
+                    } = self.volatile_state.process_type
+                    {
+                        if let Some(client) = client_senders.get_mut(&currently_applied_idx).take()
+                        {
+                            let _ = client
+                                .send(ClientRequestResponse::RegisterClientResponse(
+                                    RegisterClientResponseArgs {
+                                        content: RegisterClientResponseContent::ClientRegistered {
+                                            client_id: Uuid::from_u128(
+                                                currently_applied_idx as u128,
+                                            ),
+                                        },
+                                    },
+                                ))
+                                .await;
+                        }
+                    }
                 }
             }
+            log::info!(
+                "{}: applied entry {}.",
+                self.config.self_id,
+                currently_applied_idx
+            );
         }
     }
 
@@ -458,16 +524,17 @@ impl Raft {
             self.update_state().await;
         }
         self.volatile_state.voting_reluctant = true;
-        self.reset_voting_reluctance_timer();
 
         // Update the volatile state:
         match &mut self.volatile_state.process_type {
             ProcessType::Follower => {
                 self.reset_election_timer();
+                self.reset_voting_reluctance_timer();
             }
             ProcessType::Candidate { .. } => {
                 self.volatile_state.process_type = ProcessType::Follower;
                 self.reset_election_timer();
+                self.reset_voting_reluctance_timer();
             }
             ProcessType::Leader { .. } => {
                 log::debug!("{}: ignore, heartbeat from self", self.config.self_id);
@@ -481,14 +548,17 @@ impl Raft {
         if success {
             let first_new_entry_index = content.prev_log_index + 1;
             for i in 0..content.entries.len() {
-                match self.persistent_state.log.get(i) {
+                match self.persistent_state.log.get(first_new_entry_index + i) {
                     Some(entry) if entry.term == content.entries.get(i).unwrap().term => {
                         // Ignore, already present in the log.
                     }
                     Some(_) => {
                         // Overwrite existing entries with the leader's.
-                        self.persistent_state.log[first_new_entry_index + i] = content.entries[i].clone();
-                        self.persistent_state.log.truncate(first_new_entry_index + i);
+                        self.persistent_state.log[first_new_entry_index + i] =
+                            content.entries[i].clone();
+                        self.persistent_state
+                            .log
+                            .truncate(first_new_entry_index + i);
                     }
                     None => {
                         // The rest of entries can be simply appended.
@@ -559,8 +629,9 @@ impl Raft {
     async fn handle_request_vote(&mut self, header: RaftMessageHeader, content: RequestVoteArgs) {
         let candidate_id = header.source;
         self.message_sender
-            .send(&header.source,
-                  RaftMessage {
+            .send(
+                &header.source,
+                RaftMessage {
                     header: RaftMessageHeader {
                         source: self.config.self_id,
                         term: self.persistent_state.current_term,
@@ -572,18 +643,20 @@ impl Raft {
                                     None => true,
                                     Some(voted_for) => voted_for == candidate_id,
                                 }) && self.log_stamp()
-                                    >= LogStamp(content.last_log_term, content.last_log_index)
+                                    <= LogStamp(content.last_log_term, content.last_log_index)
                                 {
                                     self.persistent_state.voted_for = Some(candidate_id);
                                     true
                                 } else {
                                     false
                                 }
-                            },
+                            }
                             ProcessType::Leader { .. } | ProcessType::Candidate { .. } => false,
-                        }
-                    })}
-            ).await;
+                        },
+                    }),
+                },
+            )
+            .await;
         // self.send_msg_to(
         //     &header.source,
         //     RaftMessageContent::RequestVoteResponse(RequestVoteResponseArgs {
@@ -647,6 +720,7 @@ impl Handler<Init> for Raft {
 #[async_trait::async_trait]
 impl Handler<ElectionTimeout> for Raft {
     async fn handle(&mut self, _: ElectionTimeout) {
+        log::warn!("{}: received election timeout", self.config.self_id);
         match &mut self.volatile_state.process_type {
             ProcessType::Follower | ProcessType::Candidate { .. } => {
                 // (re)start being a candidate
@@ -656,11 +730,15 @@ impl Handler<ElectionTimeout> for Raft {
                 responses_collected_during_this_election: responses_collected,
                 ..
             } => {
-                if responses_collected.len() <= self.config.servers.len() / 2 {
+                if responses_collected.len() < self.config.servers.len() / 2 {
                     // "a leader steps down if an election timeout elapses without a successful
                     // round of heartbeats to a majority of its cluster"
 
                     // explicit timer stop is unnecessary due to Drop trait implementation for Timer
+                    log::warn!("{}: leader has stepped down due to unsatisfactory response rate from followers.",
+                        self.config.self_id);
+                    self.persistent_state.leader_id = None;
+                    self.update_state().await;
                     self.volatile_state.process_type = ProcessType::Follower;
                 } else {
                     responses_collected.clear();
@@ -674,9 +752,10 @@ impl Handler<ElectionTimeout> for Raft {
 #[async_trait::async_trait]
 impl Handler<HeartbeatTimeout> for Raft {
     async fn handle(&mut self, _: HeartbeatTimeout) {
+        log::debug!("{}: received heartbeat timeout", self.config.self_id);
         match &self.volatile_state.process_type {
             ProcessType::Follower | ProcessType::Candidate { .. } => {
-                // ignore but notice and warn
+                // ignore but notice and warn (stall info)
                 log::warn!("{}: received heartbeat timeout", self.config.self_id);
             }
             ProcessType::Leader {
@@ -698,6 +777,10 @@ impl Handler<HeartbeatTimeout> for Raft {
 #[async_trait::async_trait]
 impl Handler<VotingReluctanceTimeout> for Raft {
     async fn handle(&mut self, _: VotingReluctanceTimeout) {
+        log::warn!(
+            "{}: received voting reluctance timeout",
+            self.config.self_id
+        );
         self.volatile_state.voting_reluctant = false;
     }
 }
@@ -774,17 +857,37 @@ impl Handler<RaftMessage> for Raft {
 impl Handler<ClientRequest> for Raft {
     async fn handle(&mut self, msg: ClientRequest) {
         match self.volatile_state.process_type {
-            ProcessType::Leader { .. } => {
+            ProcessType::Leader {
+                ref mut client_senders,
+                ref mut match_index,
+                ..
+            } => {
                 // TODO: in Client Sessions, add verification
+                *match_index.get_mut(&self.config.self_id).unwrap() += 1;
                 match msg.content {
-                    ClientRequestContent::Command { command, client_id, sequence_num, lowest_sequence_num_without_response } => {
-                        self.client_senders.insert(client_id, msg.reply_to);
-                        self.put_into_log(LogEntryContent::Command {
-                            data: command,
-                            client_id,
-                            sequence_num,
-                            lowest_sequence_num_without_response
+                    ClientRequestContent::Command {
+                        command,
+                        client_id,
+                        sequence_num,
+                        lowest_sequence_num_without_response,
+                    } => {
+                        self.persistent_state.log.push(LogEntry {
+                            content: LogEntryContent::Command {
+                                data: command,
+                                client_id,
+                                sequence_num,
+                                lowest_sequence_num_without_response,
+                            },
+                            term: self.persistent_state.current_term,
+                            timestamp: SystemTime::now(),
                         });
+                        let entry_index = self.persistent_state.log.len() - 1;
+                        log::info!(
+                            "{}: received request from client {}: Command",
+                            self.config.self_id,
+                            client_id
+                        );
+                        client_senders.insert(entry_index, msg.reply_to);
                     }
                     ClientRequestContent::Snapshot => {
                         unimplemented!()
@@ -796,11 +899,29 @@ impl Handler<ClientRequest> for Raft {
                         unimplemented!()
                     }
                     ClientRequestContent::RegisterClient => {
-                        self.put_into_log(LogEntryContent::RegisterClient)
+                        // When a RegisterClient client request (src/domain.rs) is received, your implementation
+                        // shall commit a RegisterClient log entry (src/domain.rs), and reply with this entry’s
+                        // log index once it is committed (Figure 6.1 of [1]). However, the implementation
+                        // does not have to allocate a session.
+                        self.persistent_state.log.push(LogEntry {
+                            content: LogEntryContent::RegisterClient,
+                            term: self.persistent_state.current_term,
+                            timestamp: SystemTime::now(),
+                        });
+                        let entry_index = self.persistent_state.log.len() - 1;
+                        client_senders.insert(entry_index, msg.reply_to);
+                        log::info!(
+                            "{}: received request from client: RequestClient",
+                            self.config.self_id,
+                        );
                     }
                 };
             }
             _ => {
+                log::debug!(
+                    "{}: received request from client, so responding with leader hint.",
+                    self.config.self_id,
+                );
                 let _ = msg
                     .reply_to
                     .send(match msg.content {
@@ -825,11 +946,11 @@ impl Handler<ClientRequest> for Raft {
                             unimplemented!()
                         }
                         ClientRequestContent::RegisterClient => {
-                            // When a RegisterClient client request (src/domain.rs) is received, your implementation
-                            // shall commit a RegisterClient log entry (src/domain.rs), and reply with this entry’s
-                            // log index once it is committed (Figure 6.1 of [1]). However, the implementation
-                            // does not have to allocate a session.
-                            unimplemented!()
+                            RegisterClientResponse(RegisterClientResponseArgs {
+                                content: RegisterClientResponseContent::NotLeader {
+                                    leader_hint: self.persistent_state.leader_id,
+                                },
+                            })
                         }
                     })
                     .await;
