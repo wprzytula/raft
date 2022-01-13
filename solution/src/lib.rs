@@ -195,7 +195,6 @@ pub struct Raft {
     election_timer: Timer<ElectionTimeout>,
     election_timeout_randomizer: Uniform<Duration>,
     voting_reluctance_timer: Timer<VotingReluctanceTimeout>,
-    // TODO you can add fields to this struct.
 }
 
 impl Raft {
@@ -367,7 +366,6 @@ impl Raft {
     ) {
         log::debug!("{}: is replicating log!", self.config.self_id);
         for server in match_index.keys().filter(|&x| *x != self.config.self_id) {
-            // TODO: to filter self or not?
             let prev_log_index = next_index[server] - 1;
             self.send_msg_to(
                 server,
@@ -587,8 +585,6 @@ impl Raft {
 
         // Apply commited commands to state machine
         self.try_apply().await;
-
-        // todo!()
     }
 
     async fn handle_append_entries_response(
@@ -608,8 +604,6 @@ impl Raft {
                 if content.success {
                     *match_index.get_mut(&header.source).unwrap() = content.last_log_index;
                     *next_index.get_mut(&header.source).unwrap() = content.last_log_index + 1;
-                    // usize::min(next_index[header.source] + self.config.append_entries_batch_size, self.persistent_state.log.len());
-                    // todo!()
                     self.try_commit();
                     self.try_apply().await;
                 } else {
@@ -618,12 +612,10 @@ impl Raft {
                     } else {
                         *next_index.get_mut(&header.source).unwrap() -= 1;
                     }
-                    // todo!()
                 }
             }
             _ => unreachable!(),
         }
-        // todo!()
     }
 
     async fn handle_request_vote(&mut self, header: RaftMessageHeader, content: RequestVoteArgs) {
@@ -657,28 +649,6 @@ impl Raft {
                 },
             )
             .await;
-        // self.send_msg_to(
-        //     &header.source,
-        //     RaftMessageContent::RequestVoteResponse(RequestVoteResponseArgs {
-        //         vote_granted: match &self.volatile_state.process_type {
-        //             ProcessType::Follower => {
-        //                 if (match self.persistent_state.voted_for {
-        //                     None => true,
-        //                     Some(voted_for) => voted_for == candidate_id,
-        //                 }) && self.log_stamp()
-        //                     >= LogStamp(content.last_log_term, content.last_log_index)
-        //                 {
-        //                     self.persistent_state.voted_for = Some(candidate_id);
-        //                     true
-        //                 } else {
-        //                     false
-        //                 }
-        //             }
-        //             ProcessType::Leader { .. } | ProcessType::Candidate { .. } => false,
-        //         },
-        //     }),
-        // )
-        // .await;
     }
 
     async fn handle_request_vote_response(
@@ -761,14 +731,9 @@ impl Handler<HeartbeatTimeout> for Raft {
             ProcessType::Leader {
                 match_index,
                 next_index,
-                // heartbeat_timer,
                 ..
             } => {
                 self.replicate_log(match_index, next_index).await;
-                // heartbeat_timer.reset_timer(
-                //     self.self_ref.clone().unwrap(),
-                //     self.config.election_timeout_range.start() / 10,
-                // ); // this is already done once, on leader become
             }
         }
     }
@@ -958,5 +923,3 @@ impl Handler<ClientRequest> for Raft {
         }
     }
 }
-
-// TODO you can implement handlers of messages of other types for the Raft struct.
