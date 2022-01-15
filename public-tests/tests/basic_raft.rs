@@ -9,14 +9,11 @@ use assignment_3_solution::*;
 use assignment_3_test_utils::*;
 
 fn logger_init() {
-    if let Err(_) = env_logger::builder()
+    let _ = env_logger::builder()
         .format_timestamp(None)
         .filter_level(log::LevelFilter::Debug)
         // .is_test(true)
-        .try_init()
-    {
-        println!("Couldn't init logger")
-    };
+        .try_init();
 }
 
 #[tokio::test]

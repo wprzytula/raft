@@ -15,19 +15,17 @@ use assignment_3_test_utils::distributed_set::{DistributedSet, SetOperation, Set
 use assignment_3_test_utils::{singleton_range, ExecutorSender, RamStorage};
 
 fn logger_init() {
-    if let Err(_) = env_logger::builder()
+    let _ = env_logger::builder()
         .format_timestamp(None)
         .filter_level(log::LevelFilter::Debug)
         // .is_test(true)
-        .try_init()
-    {
-        println!("Couldn't init logger")
-    };
+        .try_init();
 }
 
 #[tokio::test]
 #[timeout(1000)]
 async fn can_remove_from_set() {
+    logger_init();
     // given
     let mut system = System::new().await;
 
@@ -139,6 +137,7 @@ async fn can_remove_from_set() {
 #[tokio::test]
 #[timeout(1000)]
 async fn single_node_adds_to_set() {
+    logger_init();
     // given
     let mut system = System::new().await;
 
