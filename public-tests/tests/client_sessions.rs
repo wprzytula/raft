@@ -197,9 +197,7 @@ async fn client_sessions_are_expired() {
         ClientRequestResponse::CommandResponse(CommandResponseArgs {
             client_id: client_id_2,
             sequence_num: 0,
-            content: CommandResponseContent::CommandApplied {
-                output: vec![5, 6, 7, 8]
-            }
+            content: CommandResponseContent::SessionExpired
         })
     );
     assert_eq!(
