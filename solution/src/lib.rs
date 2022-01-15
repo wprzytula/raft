@@ -1,6 +1,8 @@
 use async_channel::Sender;
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::iter::repeat;
+use std::ops::{DerefMut, Range, RangeInclusive};
 use std::time::{Duration, SystemTime};
 
 use executor::{Handler, ModuleRef, System};
@@ -16,6 +18,7 @@ use timing::{ElectionTimeout, HeartbeatTimeout, Timer, VotingReluctanceTimeout};
 mod domain;
 
 const STATE_KEYNAME: &str = "state";
+const SNAPSHOT_KEYNAME: &str = "snapshot";
 
 struct Init {
     self_ref: ModuleRef<Raft>,
@@ -149,10 +152,15 @@ mod sessions {
         ) {
             if self.lowest_sequence_num_without_response < lowest_sequence_num_without_response {
                 let len_before = self.responses.len();
-                self.responses.retain(|&k, _v| k >= lowest_sequence_num_without_response);
+                self.responses
+                    .retain(|&k, _v| k >= lowest_sequence_num_without_response);
                 let len_after = self.responses.len();
-                log::debug!("Removed {} acknowledged response(s). (self={}, new={})", len_before - len_after,
-                    self.lowest_sequence_num_without_response, lowest_sequence_num_without_response);
+                log::debug!(
+                    "Removed {} acknowledged response(s). (self={}, new={})",
+                    len_before - len_after,
+                    self.lowest_sequence_num_without_response,
+                    lowest_sequence_num_without_response
+                );
 
                 self.lowest_sequence_num_without_response = lowest_sequence_num_without_response;
             }
@@ -236,8 +244,12 @@ mod sessions {
                 .sessions
                 .iter()
                 .filter_map(|(&client_id, session)| {
-                    log::trace!("Last activity ({:?}) + expiration ({:?}) < current_time ({:?}) ",
-                        session.last_activity, self.session_expiration, current_time);
+                    log::trace!(
+                        "Last activity ({:?}) + expiration ({:?}) < current_time ({:?}) ",
+                        session.last_activity,
+                        self.session_expiration,
+                        current_time
+                    );
                     if session.last_activity + self.session_expiration < current_time {
                         Some(client_id)
                     } else {
@@ -332,6 +344,79 @@ impl Default for ProcessType {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct Log {
+    first_index: usize,
+    entries: Vec<LogEntry>,
+}
+
+impl Log {
+    pub fn new(timestamp: SystemTime, servers: HashSet<Uuid>) -> Self {
+        Self {
+            first_index: 0,
+            entries: vec![LogEntry {
+                content: LogEntryContent::Configuration { servers },
+                term: 0,
+                timestamp,
+            }],
+        }
+    }
+
+    pub fn last_index(&self) -> usize {
+        self.first_index + self.entries.len() - 1
+    }
+
+    pub fn has_index(&self, i: usize) -> bool {
+        self.first_index <= i && i <= self.last_index()
+    }
+
+    pub fn stamp(&self) -> LogStamp {
+        LogStamp(
+            self.entries
+                .last()
+                .map(|log_entry| log_entry.term)
+                .unwrap(),
+            self.last_index() + 1,
+        )
+    }
+
+    pub fn get(&self, i: usize) -> Option<&LogEntry> {
+        self.entries.get(i - self.first_index)
+    }
+
+    pub fn get_mut(&mut self, i: usize) -> Option<&mut LogEntry> {
+        self.entries.get_mut(i - self.first_index)
+    }
+
+    pub fn subvec(&self, range: RangeInclusive<usize>) -> Vec<LogEntry> {
+        if range.is_empty() {
+            vec![]
+        } else {
+            self.entries[(range.start() - self.first_index) ..= (range.end() - self.first_index)].to_vec()
+        }
+    }
+
+    pub fn truncate(&mut self, new_len: usize) {
+        assert!(new_len >= self.first_index);
+        self.entries.truncate(new_len - self.first_index)
+    }
+
+    pub fn append_entry(&mut self, new_entry: LogEntry) {
+        self.entries.push(new_entry);
+    }
+
+    pub async fn make_snapshot(
+        &mut self,
+        stable_storage: &mut dyn StableStorage,
+        state_machine: &mut dyn StateMachine,
+        last_snapshotted_log_entry_index: usize,
+    ) {
+        stable_storage
+            .put(SNAPSHOT_KEYNAME, state_machine.serialize().await.as_slice())
+            .await.unwrap();
+    }
+}
+
 /// Persistent state of a Raft process.
 /// It shall be kept in stable storage, and updated before replying to messages.
 #[derive(Serialize, Deserialize)]
@@ -343,7 +428,7 @@ struct PersistentState {
     voted_for: Option<Uuid>,
     /// Identifier of a process which is thought to be the leader.
     leader_id: Option<Uuid>,
-    log: Vec<LogEntry>,
+    log: Log,
 }
 
 impl PersistentState {
@@ -352,11 +437,7 @@ impl PersistentState {
             current_term: 0,
             voted_for: None,
             leader_id: None,
-            log: vec![LogEntry {
-                content: LogEntryContent::Configuration { servers },
-                term: 0,
-                timestamp,
-            }],
+            log: Log::new(timestamp, servers),
         }
     }
 }
@@ -437,21 +518,6 @@ impl Raft {
             })
             .await;
         self_ref
-    }
-
-    fn last_log_entry_index(&self) -> usize {
-        self.persistent_state.log.len() - 1
-    }
-
-    fn log_stamp(&self) -> LogStamp {
-        LogStamp(
-            self.persistent_state
-                .log
-                .last()
-                .map(|log_entry| log_entry.term)
-                .unwrap(),
-            self.last_log_entry_index() + 1,
-        )
     }
 
     fn reset_voting_reluctance_timer(&mut self) {
@@ -543,7 +609,7 @@ impl Raft {
         self.update_state().await;
         self.try_become_leader(1).await;
 
-        let LogStamp(last_log_term, last_log_index) = self.log_stamp();
+        let LogStamp(last_log_term, last_log_index) = self.persistent_state.log.stamp();
         for server in self
             .config
             .servers
@@ -561,27 +627,28 @@ impl Raft {
         }
     }
 
-    async fn replicate_log_to(
-        &self,
-        next_index: &HashMap<Uuid, usize>,
-        server: Uuid,
-    ) {
-        let prev_log_index = next_index[&server] - 1;
+    async fn replicate_log_to(&self, next_index: usize, server: Uuid) {
+        if !self.persistent_state.log.has_index(next_index) {
+            // InstallSnapshot
+        } else {
+            // AppendEntries
+        }
+
+        let prev_log_index = next_index - 1;
         self.send_msg_to(
             &server,
             RaftMessageContent::AppendEntries(AppendEntriesArgs {
                 prev_log_index,
-                prev_log_term: self.persistent_state.log[prev_log_index].term,
-                entries: self.persistent_state.log[(next_index[&server])
-                    ..(usize::min(
-                    self.persistent_state.log.len(),
-                    prev_log_index + self.config.append_entries_batch_size,
-                ))]
-                    .to_vec(),
+                prev_log_term: self.persistent_state.log.get(prev_log_index).unwrap().term,
+                entries: self.persistent_state.log.subvec(next_index
+                    ..=usize::min(
+                        self.persistent_state.log.last_index(),
+                        prev_log_index + self.config.append_entries_batch_size,
+                    )),
                 leader_commit: self.volatile_state.commit_index,
             }),
         )
-            .await;
+        .await;
     }
 
     async fn replicate_log(
@@ -591,7 +658,7 @@ impl Raft {
     ) {
         log::debug!("{}: is replicating log!", self.config.self_id);
         for server in match_index.keys().filter(|&x| *x != self.config.self_id) {
-            self.replicate_log_to(next_index, *server).await;
+            self.replicate_log_to(next_index[server], *server).await;
         }
     }
 
@@ -599,7 +666,8 @@ impl Raft {
         if votes_received > self.config.servers.len() / 2 {
             // become the leader
             self.volatile_state.process_type =
-                ProcessType::new_leader(&self.config.servers, self.last_log_entry_index());
+                ProcessType::new_leader(&self.config.servers,
+                                        self.persistent_state.log.last_index());
             self.persistent_state.leader_id = Some(self.config.self_id);
             self.persistent_state.voted_for = None;
             self.update_state().await;
@@ -634,11 +702,16 @@ impl Raft {
             ProcessType::Leader {
                 ref match_index, ..
             } => {
-                for i in (self.volatile_state.commit_index + 1)..=self.last_log_entry_index() {
+                for i in (self.volatile_state.commit_index + 1)..=self.persistent_state.log.last_index() {
                     if match_index.values().filter(|&val| *val >= i).count()
                         > self.config.servers.len() / 2
                     {
-                        log::info!("{}: commited entry {}: {:?}.", self.config.self_id, i, self.persistent_state.log[i]);
+                        log::info!(
+                            "{}: commited entry {}: {:?}.",
+                            self.config.self_id,
+                            i,
+                            self.persistent_state.log.get(i).unwrap()
+                        );
                         self.volatile_state.commit_index = i;
                     } else {
                         log::warn!(
@@ -659,13 +732,17 @@ impl Raft {
         while self.volatile_state.commit_index > self.volatile_state.last_applied {
             self.volatile_state.last_applied += 1;
             let currently_applied_idx = self.volatile_state.last_applied;
-            let newly_commited_entry = &self.persistent_state.log[currently_applied_idx];
+            let newly_commited_entry = &self.persistent_state.log.get(currently_applied_idx).unwrap();
 
             self.volatile_state
                 .session_management
                 .expire_too_old(newly_commited_entry.timestamp);
 
-            log::debug!("{}: Applying {:?}", self.config.self_id, newly_commited_entry);
+            log::debug!(
+                "{}: Applying {:?}",
+                self.config.self_id,
+                newly_commited_entry
+            );
 
             match newly_commited_entry.content {
                 LogEntryContent::Command {
@@ -803,8 +880,8 @@ impl Raft {
         self.handle_heartbeat(leader_id).await;
 
         // Update log
-        let success = self.last_log_entry_index() >= content.prev_log_index
-            && self.persistent_state.log[content.prev_log_index].term == content.prev_log_term;
+        let success = self.persistent_state.log.get(content.prev_log_index)
+            .map_or(false, |entry| entry.term == content.prev_log_term);
         if success {
             let first_new_entry_index = content.prev_log_index + 1;
             for i in 0..content.entries.len() {
@@ -814,7 +891,7 @@ impl Raft {
                     }
                     Some(_) => {
                         // Overwrite existing entries with the leader's.
-                        self.persistent_state.log[first_new_entry_index + i] =
+                        *self.persistent_state.log.get_mut(first_new_entry_index + i).unwrap() =
                             content.entries[i].clone();
                         self.persistent_state
                             .log
@@ -824,6 +901,7 @@ impl Raft {
                         // The rest of entries can be simply appended.
                         self.persistent_state
                             .log
+                            .entries
                             .extend_from_slice(&content.entries[i..]);
                         break;
                     }
@@ -836,14 +914,14 @@ impl Raft {
         self.update_state().await;
 
         self.volatile_state.commit_index =
-            usize::min(content.leader_commit, self.last_log_entry_index());
+            usize::min(content.leader_commit, self.persistent_state.log.last_index());
 
         // Respond to leader
         self.send_msg_to(
             &leader_id,
             RaftMessageContent::AppendEntriesResponse(AppendEntriesResponseArgs {
                 success,
-                last_log_index: self.last_log_entry_index(),
+                last_log_index: self.persistent_state.log.last_index(),
             }),
         )
         .await;
@@ -869,12 +947,12 @@ impl Raft {
                 if content.success {
                     *match_index.get_mut(&header.source).unwrap() = content.last_log_index;
                     *next_index.get_mut(&header.source).unwrap() = content.last_log_index + 1;
-                    let should_resend_append_entries = *next_index.get(&header.source).unwrap() <= self.last_log_entry_index();
+                    let should_resend_append_entries =
+                        *next_index.get(&header.source).unwrap() <= self.persistent_state.log.last_index();
                     self.try_commit();
                     self.try_apply().await;
 
                     should_resend_append_entries
-
                 } else {
                     if content.last_log_index < next_index[&header.source] {
                         *next_index.get_mut(&header.source).unwrap() = content.last_log_index;
@@ -889,13 +967,15 @@ impl Raft {
         };
 
         if should_resend_append_entries {
-            log::debug!("{}: Resending AppendEntries because there are still some entries to share.",
-                self.config.self_id);
+            log::debug!(
+                "{}: Resending AppendEntries because there are still some entries to share.",
+                self.config.self_id
+            );
             match self.volatile_state.process_type {
-                ProcessType::Leader { ref next_index, ..} => {
-                    self.replicate_log_to(next_index, header.source).await;
+                ProcessType::Leader { ref next_index, .. } => {
+                    self.replicate_log_to(next_index[&header.source], header.source).await;
                 }
-                _ => unreachable!()
+                _ => unreachable!(),
             }
         }
     }
@@ -916,7 +996,7 @@ impl Raft {
                                 if (match self.persistent_state.voted_for {
                                     None => true,
                                     Some(voted_for) => voted_for == candidate_id,
-                                }) && self.log_stamp()
+                                }) && self.persistent_state.log.stamp()
                                     <= LogStamp(content.last_log_term, content.last_log_index)
                                 {
                                     self.persistent_state.voted_for = Some(candidate_id);
@@ -957,6 +1037,23 @@ impl Raft {
         if should_try_become_leader {
             self.try_become_leader(votes_count).await;
         }
+    }
+
+    async fn make_snapshot(&mut self) {
+        assert_eq!(
+            self.volatile_state.commit_index,
+            self.volatile_state.last_applied
+        );
+        self.persistent_state
+            .log
+            .make_snapshot(
+                &mut *self.stable_storage,
+                &mut *self.state_machine,
+                self.volatile_state.commit_index,
+            )
+            .await;
+
+        todo!()
     }
 }
 
@@ -1061,7 +1158,7 @@ impl Handler<RaftMessage> for Raft {
                         &msg.header.source,
                         RaftMessageContent::AppendEntriesResponse(AppendEntriesResponseArgs {
                             success: false,
-                            last_log_index: self.last_log_entry_index(),
+                            last_log_index: self.persistent_state.log.last_index(),
                         }),
                     )
                     .await;
@@ -1108,89 +1205,45 @@ impl Handler<RaftMessage> for Raft {
 #[async_trait::async_trait]
 impl Handler<ClientRequest> for Raft {
     async fn handle(&mut self, msg: ClientRequest) {
-        match self.volatile_state.process_type {
-            ProcessType::Leader {
-                ref mut client_senders,
-                ref mut match_index,
-                ref mut next_index,
-                ..
-            } => {
-                *match_index.get_mut(&self.config.self_id).unwrap() += 1;
-                *next_index.get_mut(&self.config.self_id).unwrap() += 1;
-                match msg.content {
-                    ClientRequestContent::Command {
-                        command,
-                        client_id,
-                        sequence_num,
-                        lowest_sequence_num_without_response,
-                    } => {
-                        self.persistent_state.log.push(LogEntry {
-                            content: LogEntryContent::Command {
-                                data: command,
-                                client_id,
-                                sequence_num,
-                                lowest_sequence_num_without_response,
-                            },
-                            term: self.persistent_state.current_term,
-                            timestamp: SystemTime::now(),
-                        });
-                        let entry_index = self.persistent_state.log.len() - 1;
-                        log::info!(
-                            "{}: received request from client {}: Command",
-                            self.config.self_id,
-                            client_id
-                        );
-                        client_senders.insert(entry_index, msg.reply_to);
-                    }
-                    ClientRequestContent::Snapshot => {
-                        unimplemented!()
-                    }
-                    ClientRequestContent::AddServer { .. } => {
-                        unimplemented!()
-                    }
-                    ClientRequestContent::RemoveServer { .. } => {
-                        unimplemented!()
-                    }
-                    ClientRequestContent::RegisterClient => {
-                        // When a RegisterClient client request (src/domain.rs) is received, your implementation
-                        // shall commit a RegisterClient log entry (src/domain.rs), and reply with this entry’s
-                        // log index once it is committed (Figure 6.1 of [1]). However, the implementation
-                        // does not have to allocate a session.
-                        self.persistent_state.log.push(LogEntry {
-                            content: LogEntryContent::RegisterClient,
-                            term: self.persistent_state.current_term,
-                            timestamp: SystemTime::now(),
-                        });
-                        let entry_index = self.persistent_state.log.len() - 1;
-                        client_senders.insert(entry_index, msg.reply_to);
-                        log::info!(
-                            "{}: received request from client: RequestClient",
-                            self.config.self_id,
-                        );
-                    }
-                };
-            }
-            _ => {
-                log::debug!(
-                    "{}: received request from client not being the leader, so responding with leader hint.",
-                    self.config.self_id,
-                );
-                let _ = msg
-                    .reply_to
-                    .send(match msg.content {
+        if let ClientRequestContent::Snapshot = msg.content {
+            self.make_snapshot().await;
+        } else {
+            match self.volatile_state.process_type {
+                ProcessType::Leader {
+                    ref mut client_senders,
+                    ref mut match_index,
+                    ref mut next_index,
+                    ..
+                } => {
+                    *match_index.get_mut(&self.config.self_id).unwrap() += 1;
+                    *next_index.get_mut(&self.config.self_id).unwrap() += 1;
+                    match msg.content {
                         ClientRequestContent::Command {
+                            command,
                             client_id,
                             sequence_num,
-                            ..
-                        } => ClientRequestResponse::CommandResponse(CommandResponseArgs {
-                            client_id,
-                            sequence_num,
-                            content: CommandResponseContent::NotLeader {
-                                leader_hint: self.persistent_state.leader_id,
-                            },
-                        }),
+                            lowest_sequence_num_without_response,
+                        } => {
+                            self.persistent_state.log.append_entry(LogEntry {
+                                content: LogEntryContent::Command {
+                                    data: command,
+                                    client_id,
+                                    sequence_num,
+                                    lowest_sequence_num_without_response,
+                                },
+                                term: self.persistent_state.current_term,
+                                timestamp: SystemTime::now(),
+                            });
+                            let entry_index = self.persistent_state.log.last_index();
+                            log::info!(
+                                "{}: received request from client {}: Command",
+                                self.config.self_id,
+                                client_id
+                            );
+                            client_senders.insert(entry_index, msg.reply_to);
+                        }
                         ClientRequestContent::Snapshot => {
-                            unimplemented!()
+                            unreachable!()
                         }
                         ClientRequestContent::AddServer { .. } => {
                             unimplemented!()
@@ -1199,16 +1252,64 @@ impl Handler<ClientRequest> for Raft {
                             unimplemented!()
                         }
                         ClientRequestContent::RegisterClient => {
-                            ClientRequestResponse::RegisterClientResponse(
-                                RegisterClientResponseArgs {
-                                    content: RegisterClientResponseContent::NotLeader {
-                                        leader_hint: self.persistent_state.leader_id,
-                                    },
-                                },
-                            )
+                            // When a RegisterClient client request (src/domain.rs) is received, your implementation
+                            // shall commit a RegisterClient log entry (src/domain.rs), and reply with this entry’s
+                            // log index once it is committed (Figure 6.1 of [1]). However, the implementation
+                            // does not have to allocate a session.
+                            self.persistent_state.log.append_entry(LogEntry {
+                                content: LogEntryContent::RegisterClient,
+                                term: self.persistent_state.current_term,
+                                timestamp: SystemTime::now(),
+                            });
+                            let entry_index = self.persistent_state.log.last_index();
+                            client_senders.insert(entry_index, msg.reply_to);
+                            log::info!(
+                                "{}: received request from client: RequestClient",
+                                self.config.self_id,
+                            );
                         }
-                    })
-                    .await;
+                    };
+                }
+                _ => {
+                    log::debug!(
+                    "{}: received request from client not being the leader, so responding with leader hint.",
+                    self.config.self_id,
+                );
+                    let _ = msg
+                        .reply_to
+                        .send(match msg.content {
+                            ClientRequestContent::Command {
+                                client_id,
+                                sequence_num,
+                                ..
+                            } => ClientRequestResponse::CommandResponse(CommandResponseArgs {
+                                client_id,
+                                sequence_num,
+                                content: CommandResponseContent::NotLeader {
+                                    leader_hint: self.persistent_state.leader_id,
+                                },
+                            }),
+                            ClientRequestContent::Snapshot => {
+                                unreachable!()
+                            }
+                            ClientRequestContent::AddServer { .. } => {
+                                unimplemented!()
+                            }
+                            ClientRequestContent::RemoveServer { .. } => {
+                                unimplemented!()
+                            }
+                            ClientRequestContent::RegisterClient => {
+                                ClientRequestResponse::RegisterClientResponse(
+                                    RegisterClientResponseArgs {
+                                        content: RegisterClientResponseContent::NotLeader {
+                                            leader_hint: self.persistent_state.leader_id,
+                                        },
+                                    },
+                                )
+                            }
+                        })
+                        .await;
+                }
             }
         }
     }
