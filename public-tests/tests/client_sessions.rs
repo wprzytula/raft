@@ -10,19 +10,17 @@ use assignment_3_solution::*;
 use assignment_3_test_utils::*;
 
 fn logger_init() {
-    if let Err(_) = env_logger::builder()
+    let _ = env_logger::builder()
         .format_timestamp(None)
         .filter_level(log::LevelFilter::Debug)
         // .is_test(true)
-        .try_init()
-    {
-        println!("Couldn't init logger")
-    };
+        .try_init();
 }
 
 #[tokio::test]
 #[timeout(500)]
 async fn client_sessions_give_exactly_once_semantics() {
+    logger_init();
     let mut system = System::new().await;
     let leader_id = Uuid::new_v4();
     let follower_id = Uuid::new_v4();
@@ -115,6 +113,7 @@ async fn client_sessions_give_exactly_once_semantics() {
 #[tokio::test]
 #[timeout(2000)]
 async fn client_sessions_are_expired() {
+    logger_init();
     let mut system = System::new().await;
     let leader_id = Uuid::new_v4();
     let follower_id = Uuid::new_v4();
@@ -219,6 +218,7 @@ async fn client_sessions_are_expired() {
 #[tokio::test]
 #[timeout(2000)]
 async fn acknowledged_outputs_are_discarded() {
+    logger_init();
     let mut system = System::new().await;
     let leader_id = Uuid::new_v4();
     let follower_id = Uuid::new_v4();

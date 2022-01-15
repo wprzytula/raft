@@ -13,19 +13,17 @@ use assignment_3_solution::*;
 use assignment_3_test_utils::*;
 
 fn logger_init() {
-    if let Err(_) = env_logger::builder()
+    let _ = env_logger::builder()
         .format_timestamp(None)
         .filter_level(log::LevelFilter::Debug)
         // .is_test(true)
-        .try_init()
-    {
-        println!("Couldn't init logger")
-    };
+        .try_init();
 }
 
 #[tokio::test]
 #[timeout(500)]
 async fn snapshot_is_sent_to_follower_correctly() {
+    logger_init();
     let mut system = System::new().await;
     let leader_id = Uuid::new_v4();
     let follower_id = Uuid::new_v4();
@@ -203,6 +201,7 @@ async fn snapshot_is_sent_to_follower_correctly() {
 #[tokio::test]
 #[timeout(500)]
 async fn state_machine_is_initialized_with_snapshot() {
+    logger_init();
     // given
     let leader_id = Uuid::new_v4();
     let processes = vec![leader_id];

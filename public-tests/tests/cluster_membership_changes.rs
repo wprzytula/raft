@@ -10,19 +10,17 @@ use assignment_3_solution::*;
 use assignment_3_test_utils::*;
 
 fn logger_init() {
-    if let Err(_) = env_logger::builder()
+    let _ = env_logger::builder()
         .format_timestamp(None)
         .filter_level(log::LevelFilter::Debug)
         // .is_test(true)
-        .try_init()
-    {
-        println!("Couldn't init logger")
-    };
+        .try_init();
 }
 
 #[tokio::test]
 #[timeout(1000)]
 async fn added_server_participates_in_consensus() {
+    logger_init();
     // given
     let mut system = System::new().await;
     let leader_id = Uuid::new_v4();
@@ -117,6 +115,7 @@ async fn added_server_participates_in_consensus() {
 #[tokio::test]
 #[timeout(1000)]
 async fn removed_server_does_not_participate_in_consensus() {
+    logger_init();
     // given
     let mut system = System::new().await;
     let leader_id = Uuid::new_v4();
@@ -204,6 +203,7 @@ async fn removed_server_does_not_participate_in_consensus() {
 #[tokio::test]
 #[timeout(500)]
 async fn messages_outside_cluster_configuration_are_accepted() {
+    logger_init();
     // given
     let mut system = System::new().await;
     let follower_id = Uuid::new_v4();
