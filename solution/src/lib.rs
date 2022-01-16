@@ -104,7 +104,7 @@ mod timing {
 }
 
 mod sessions {
-    use crate::ClientRequestResponse;
+    use crate::{ClientRequestResponse, ClientSession};
     use std::cmp::Reverse;
     use std::collections::{BinaryHeap, HashMap};
     use std::time::{Duration, SystemTime};
@@ -112,17 +112,11 @@ mod sessions {
 
     pub enum Response {
         NotYetApplied,
-        AlreadyApplied(ClientRequestResponse),
+        AlreadyApplied(Vec<u8>),
         SessionExpired,
     }
 
-    struct Session {
-        last_activity: SystemTime,
-        lowest_sequence_num_without_response: u64,
-        responses: HashMap<u64, ClientRequestResponse>,
-    }
-
-    impl Session {
+    impl ClientSession {
         pub fn new(creation_time: SystemTime) -> Self {
             Self {
                 last_activity: creation_time,
@@ -131,7 +125,7 @@ mod sessions {
             }
         }
 
-        pub fn save_response(&mut self, sequence_id: u64, response: ClientRequestResponse) {
+        pub fn save_response(&mut self, sequence_id: u64, response: Vec<u8>) {
             self.responses.insert(sequence_id, response);
         }
 
@@ -170,7 +164,7 @@ mod sessions {
     pub struct SessionManagment {
         self_id: Uuid,
         session_expiration: Duration,
-        sessions: HashMap<Uuid, Session>,
+        sessions: HashMap<Uuid, ClientSession>,
         // last_activities: BinaryHeap<Reverse<(SystemTime, Uuid)>>,
     }
 
@@ -185,7 +179,7 @@ mod sessions {
         }
 
         pub fn new_session(&mut self, client_id: Uuid, creation_time: SystemTime) {
-            self.sessions.insert(client_id, Session::new(creation_time));
+            self.sessions.insert(client_id, ClientSession::new(creation_time));
             // self.last_activities.push(Reverse((creation_time, client_id)));
             log::debug!(
                 "{}: Initialized session for client: {}",
@@ -218,7 +212,7 @@ mod sessions {
             &mut self,
             client_id: Uuid,
             sequence_id: u64,
-            response: ClientRequestResponse,
+            response: Vec<u8>,
         ) {
             log::debug!(
                 "{}: Saved response for retransmissions: {:?}",
@@ -765,20 +759,24 @@ impl Raft {
                     {
                         Response::NotYetApplied => {
                             let output = self.state_machine.apply(data.as_slice()).await;
-                            let response =
-                                ClientRequestResponse::CommandResponse(CommandResponseArgs {
-                                    client_id,
-                                    sequence_num,
-                                    content: CommandResponseContent::CommandApplied { output },
-                                });
                             self.volatile_state.session_management.save_response(
                                 client_id,
                                 sequence_num,
-                                response.clone(),
+                                output.clone(),
                             );
-                            response
+                            ClientRequestResponse::CommandResponse(CommandResponseArgs {
+                                client_id,
+                                sequence_num,
+                                content: CommandResponseContent::CommandApplied { output },
+                            })
                         }
-                        Response::AlreadyApplied(response) => response,
+                        Response::AlreadyApplied(output) => {
+                            ClientRequestResponse::CommandResponse(CommandResponseArgs {
+                                client_id,
+                                sequence_num,
+                                content: CommandResponseContent::CommandApplied { output },
+                            })
+                        },
                         Response::SessionExpired => {
                             ClientRequestResponse::CommandResponse(CommandResponseArgs {
                                 client_id,
