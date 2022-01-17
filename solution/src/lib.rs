@@ -8,6 +8,9 @@ use rand::distributions::{Distribution, Uniform};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::state_machine_manager::{
+    StateMachineManager, StateMachineRequest, StateMachineResponse,
+};
 pub use domain::*;
 use sessions::Response;
 use sessions::SessionManagment;
@@ -19,6 +22,7 @@ const STATE_KEYNAME: &str = "state";
 
 struct Init {
     self_ref: ModuleRef<Raft>,
+    state_machine_ref: ModuleRef<StateMachineManager>,
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -101,14 +105,16 @@ mod timing {
 }
 
 mod sessions {
-    use crate::{ClientRequestResponse, ClientSession};
+    use crate::{ClientRequestResponse, ClientSession, ProcessType};
     use std::cmp::Reverse;
-    use std::collections::{BinaryHeap, HashMap};
+    use std::collections::{BinaryHeap, HashMap, HashSet};
     use std::time::{Duration, SystemTime};
+    use log::Level::Debug;
     use uuid::Uuid;
 
     pub enum Response {
         NotYetApplied,
+        BeingApplied,
         AlreadyApplied(Vec<u8>),
         SessionExpired,
     }
@@ -158,10 +164,15 @@ mod sessions {
         }
     }
 
+    type CommandsBeingApplied = HashSet<u64>;
+    type AwaitingResponses = HashMap<u64, usize>;
+
     pub struct SessionManagment {
         self_id: Uuid,
         session_expiration: Duration,
-        sessions: HashMap<Uuid, ClientSession>,
+        // This nested HashMap is number of repeated requests awaiting for State Machine
+        // application of the command, per sequence_num.
+        sessions: HashMap<Uuid, (ClientSession, CommandsBeingApplied, AwaitingResponses)>,
         // last_activities: BinaryHeap<Reverse<(SystemTime, Uuid)>>,
     }
 
@@ -176,7 +187,8 @@ mod sessions {
         }
 
         pub fn new_session(&mut self, client_id: Uuid, creation_time: SystemTime) {
-            self.sessions.insert(client_id, ClientSession::new(creation_time));
+            self.sessions
+                .insert(client_id, (ClientSession::new(creation_time), Default::default(), Default::default()));
             // self.last_activities.push(Reverse((creation_time, client_id)));
             log::debug!(
                 "{}: Initialized session for client: {}",
@@ -185,13 +197,62 @@ mod sessions {
             );
         }
 
+        pub fn save_response(&mut self, client_id: Uuid, sequence_id: u64, response: Vec<u8>) {
+            log::debug!(
+                "{}: Saved response for retransmissions: {:?}",
+                self.self_id,
+                response
+            );
+            let (session, being_applied, _) = self.sessions
+                .get_mut(&client_id)
+                .unwrap();
+            session.save_response(sequence_id, response);
+            being_applied.remove(&sequence_id);
+        }
+
+        pub fn reuse_response(&self, client_id: &Uuid, sequence_num: u64) -> Response {
+            self.sessions
+                .get(client_id)
+                .map_or(Response::SessionExpired, |(session, being_applied, _)| {
+                    if being_applied.contains(&sequence_num) {
+                        Response::BeingApplied
+                    } else {
+                        session.reuse_response(sequence_num)
+                    }
+                })
+        }
+
+        pub fn await_completion(&mut self, client_id: &Uuid, sequence_num: u64) {
+            let (_, _, ref mut awaiting) = self.sessions.get_mut(client_id).unwrap();
+            match awaiting.get_mut(&sequence_num) {
+                None => {
+                    awaiting.insert(sequence_num, 1);
+                }
+                Some(num) => {
+                    *num += 1;
+                },
+            }
+        }
+
+        pub fn release_awaiting(&mut self, client_id: &Uuid, sequence_num: u64) -> usize {
+            match self.sessions.get_mut(client_id) {
+                None => {
+                    0
+                }
+                Some((_, ref mut being_applied, ref mut awaiting)) => {
+                    being_applied.remove(&sequence_num);
+                    awaiting.get(&sequence_num).copied().unwrap_or(0usize)
+                }
+            }
+        }
+
         pub fn new_activity(
             &mut self,
             client_id: Uuid,
             timestamp: SystemTime,
             lowest_sequence_num_without_response: u64,
         ) {
-            if let Some(session) = self.sessions.get_mut(&client_id) {
+            if let Some((session, _, _)) = self.sessions.get_mut(&client_id) {
                 log::debug!("{}: New activity of client: {}", self.self_id, client_id);
                 session.remove_acknowledged_lower_than(lowest_sequence_num_without_response);
                 session.last_activity = timestamp;
@@ -205,36 +266,11 @@ mod sessions {
             }
         }
 
-        pub fn save_response(
-            &mut self,
-            client_id: Uuid,
-            sequence_id: u64,
-            response: Vec<u8>,
-        ) {
-            log::debug!(
-                "{}: Saved response for retransmissions: {:?}",
-                self.self_id,
-                response
-            );
-            self.sessions
-                .get_mut(&client_id)
-                .unwrap()
-                .save_response(sequence_id, response);
-        }
-
-        pub fn reuse_response(&self, client_id: &Uuid, sequence_num: u64) -> Response {
-            self.sessions
-                .get(client_id)
-                .map_or(Response::SessionExpired, |session| {
-                    session.reuse_response(sequence_num)
-                })
-        }
-
         pub fn expire_too_old(&mut self, current_time: SystemTime) {
             for expired_client in self
                 .sessions
                 .iter()
-                .filter_map(|(&client_id, session)| {
+                .filter_map(|(&client_id, (session, _, _))| {
                     log::trace!(
                         "Last activity ({:?}) + expiration ({:?}) < current_time ({:?}) ",
                         session.last_activity,
@@ -278,6 +314,67 @@ mod sessions {
             //         log::warn!("{}: Expired client session: {}", self.self_id, client_that_possibly_expired);
             //     }
             // }
+        }
+    }
+}
+
+mod state_machine_manager {
+    use crate::{Raft, StateMachine};
+    use executor::{Handler, ModuleRef};
+
+    pub enum StateMachineRequest {
+        MakeSnapshot,
+        LoadSnapshot(Vec<u8>),
+        Input { log_index: usize, data: Vec<u8> },
+    }
+
+    pub enum StateMachineResponse {
+        Snapshot(Vec<u8>),
+        SnapshotLoaded,
+        Output { log_index: usize, data: Vec<u8> },
+    }
+
+    pub struct StateMachineManager {
+        state_machine: Box<dyn StateMachine>,
+        raft_ref: ModuleRef<Raft>,
+    }
+
+    impl StateMachineManager {
+        pub fn new(state_machine: Box<dyn StateMachine>, raft_ref: ModuleRef<Raft>) -> Self {
+            Self {
+                state_machine,
+                raft_ref,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Handler<StateMachineRequest> for StateMachineManager {
+        async fn handle(&mut self, msg: StateMachineRequest) {
+            match msg {
+                StateMachineRequest::MakeSnapshot => {
+                    let snapshot = self.state_machine.serialize().await;
+                    self.raft_ref
+                        .send(StateMachineResponse::Snapshot(snapshot))
+                        .await;
+                }
+                StateMachineRequest::LoadSnapshot(snapshot) => {
+                    self.state_machine.initialize(snapshot.as_slice()).await;
+                    self.raft_ref
+                        .send(StateMachineResponse::SnapshotLoaded)
+                        .await;
+                }
+                StateMachineRequest::Input { data, log_index } => {
+                    let output = self.state_machine.apply(data.as_slice()).await;
+                    log::debug!("State machine has applied another command.");
+                    self.raft_ref
+                        .send(StateMachineResponse::Output {
+                            log_index,
+                            data: output,
+                        })
+                        .await;
+                }
+            }
         }
     }
 }
@@ -389,10 +486,10 @@ pub struct Raft {
     persistent_state: PersistentState,
     volatile_state: VolatileState,
     config: ServerConfig,
-    state_machine: Box<dyn StateMachine>,
     stable_storage: Box<dyn StableStorage>,
     message_sender: Box<dyn RaftSender>,
     self_ref: Option<ModuleRef<Raft>>,
+    state_machine_ref: Option<ModuleRef<StateMachineManager>>,
     election_timer: Timer<ElectionTimeout>,
     election_timeout_randomizer: Uniform<Duration>,
     voting_reluctance_timer: Timer<VotingReluctanceTimeout>,
@@ -422,10 +519,10 @@ impl Raft {
                     )),
                 volatile_state: VolatileState::new(config.self_id, config.session_expiration),
                 config,
-                state_machine,
                 stable_storage,
                 message_sender,
                 self_ref: None,
+                state_machine_ref: None,
                 election_timer: Timer::new(),
                 election_timeout_randomizer: Uniform::new_inclusive(
                     election_timeout_range.start(),
@@ -434,9 +531,13 @@ impl Raft {
                 voting_reluctance_timer: Timer::new(),
             })
             .await;
+        let state_machine_ref = system
+            .register_module(StateMachineManager::new(state_machine, self_ref.clone()))
+            .await;
         self_ref
             .send(Init {
                 self_ref: self_ref.clone(),
+                state_machine_ref,
             })
             .await;
         self_ref
@@ -564,11 +665,7 @@ impl Raft {
         }
     }
 
-    async fn replicate_log_to(
-        &self,
-        next_index: &HashMap<Uuid, usize>,
-        server: Uuid,
-    ) {
+    async fn replicate_log_to(&self, next_index: &HashMap<Uuid, usize>, server: Uuid) {
         let prev_log_index = next_index[&server] - 1;
         self.send_msg_to(
             &server,
@@ -577,14 +674,14 @@ impl Raft {
                 prev_log_term: self.persistent_state.log[prev_log_index].term,
                 entries: self.persistent_state.log[(next_index[&server])
                     ..(usize::min(
-                    self.persistent_state.log.len(),
-                    prev_log_index + self.config.append_entries_batch_size,
-                ))]
+                        self.persistent_state.log.len(),
+                        prev_log_index + self.config.append_entries_batch_size,
+                    ))]
                     .to_vec(),
                 leader_commit: self.volatile_state.commit_index,
             }),
         )
-            .await;
+        .await;
     }
 
     async fn replicate_log(
@@ -641,7 +738,12 @@ impl Raft {
                     if match_index.values().filter(|&val| *val >= i).count()
                         > self.config.servers.len() / 2
                     {
-                        log::info!("{}: commited entry {}: {:?}.", self.config.self_id, i, self.persistent_state.log[i]);
+                        log::info!(
+                            "{}: commited entry {}: {:?}.",
+                            self.config.self_id,
+                            i,
+                            self.persistent_state.log[i]
+                        );
                         self.volatile_state.commit_index = i;
                     } else {
                         log::warn!(
@@ -668,7 +770,11 @@ impl Raft {
                 .session_management
                 .expire_too_old(newly_commited_entry.timestamp);
 
-            log::debug!("{}: Applying {:?}", self.config.self_id, newly_commited_entry);
+            log::debug!(
+                "{}: Applying {:?}",
+                self.config.self_id,
+                newly_commited_entry
+            );
 
             match newly_commited_entry.content {
                 LogEntryContent::Command {
@@ -690,32 +796,42 @@ impl Raft {
                         .reuse_response(&client_id, sequence_num)
                     {
                         Response::NotYetApplied => {
-                            let output = self.state_machine.apply(data.as_slice()).await;
-                            self.volatile_state.session_management.save_response(
-                                client_id,
-                                sequence_num,
-                                output.clone(),
-                            );
-                            ClientRequestResponse::CommandResponse(CommandResponseArgs {
-                                client_id,
-                                sequence_num,
-                                content: CommandResponseContent::CommandApplied { output },
-                            })
+                            self.state_machine_ref
+                                .as_ref()
+                                .unwrap()
+                                .send(StateMachineRequest::Input {
+                                    log_index: currently_applied_idx,
+                                    data: data.clone(),
+                                })
+                                .await;
+                            self.volatile_state.session_management.await_completion(&client_id, sequence_num);
+                            None
+                        }
+                        Response::BeingApplied => {
+                            self.volatile_state.session_management.await_completion(&client_id, sequence_num);
+                            None
                         }
                         Response::AlreadyApplied(output) => {
-                            ClientRequestResponse::CommandResponse(CommandResponseArgs {
-                                client_id,
-                                sequence_num,
-                                content: CommandResponseContent::CommandApplied { output },
-                            })
+                            log::info!(
+                                "{}: applied entry {}.",
+                                self.config.self_id,
+                                currently_applied_idx
+                            );
+                            Some(
+                                ClientRequestResponse::CommandResponse(CommandResponseArgs {
+                                    client_id,
+                                    sequence_num,
+                                    content: CommandResponseContent::CommandApplied { output },
+                                }),
+                            )
                         },
-                        Response::SessionExpired => {
-                            ClientRequestResponse::CommandResponse(CommandResponseArgs {
+                        Response::SessionExpired => Some(ClientRequestResponse::CommandResponse(
+                            CommandResponseArgs {
                                 client_id,
                                 sequence_num,
                                 content: CommandResponseContent::SessionExpired,
-                            })
-                        }
+                            },
+                        )),
                     };
 
                     if let ProcessType::Leader {
@@ -723,15 +839,18 @@ impl Raft {
                         ..
                     } = self.volatile_state.process_type
                     {
-                        if let Some(client) = client_senders.get_mut(&currently_applied_idx).take()
-                        {
-                            log::debug!(
-                                "{}: sent response to client {}: {:?}",
-                                self.config.self_id,
-                                client_id,
-                                response
-                            );
-                            let _ = client.send(response).await;
+                        if let Some(response) = response {
+                            if let Some(client) =
+                                client_senders.get_mut(&currently_applied_idx).take()
+                            {
+                                log::debug!(
+                                    "{}: sent response to client {}: {:?}",
+                                    self.config.self_id,
+                                    client_id,
+                                    response
+                                );
+                                let _ = client.send(response).await;
+                            }
                         }
                     }
                 }
@@ -769,11 +888,6 @@ impl Raft {
                     }
                 }
             }
-            log::info!(
-                "{}: applied entry {}.",
-                self.config.self_id,
-                currently_applied_idx
-            );
         }
     }
 
@@ -876,12 +990,12 @@ impl Raft {
                 if content.success {
                     *match_index.get_mut(&header.source).unwrap() = content.last_log_index;
                     *next_index.get_mut(&header.source).unwrap() = content.last_log_index + 1;
-                    let should_resend_append_entries = *next_index.get(&header.source).unwrap() <= self.last_log_entry_index();
+                    let should_resend_append_entries =
+                        *next_index.get(&header.source).unwrap() <= self.last_log_entry_index();
                     self.try_commit();
                     self.try_apply().await;
 
                     should_resend_append_entries
-
                 } else {
                     if content.last_log_index < next_index[&header.source] {
                         *next_index.get_mut(&header.source).unwrap() = content.last_log_index;
@@ -896,13 +1010,15 @@ impl Raft {
         };
 
         if should_resend_append_entries {
-            log::debug!("{}: Resending AppendEntries because there are still some entries to share.",
-                self.config.self_id);
+            log::debug!(
+                "{}: Resending AppendEntries because there are still some entries to share.",
+                self.config.self_id
+            );
             match self.volatile_state.process_type {
-                ProcessType::Leader { ref next_index, ..} => {
+                ProcessType::Leader { ref next_index, .. } => {
                     self.replicate_log_to(next_index, header.source).await;
                 }
-                _ => unreachable!()
+                _ => unreachable!(),
             }
         }
     }
@@ -971,6 +1087,7 @@ impl Raft {
 impl Handler<Init> for Raft {
     async fn handle(&mut self, msg: Init) {
         self.self_ref = Some(msg.self_ref);
+        self.state_machine_ref = Some(msg.state_machine_ref);
         self.reset_election_timer();
         self.reset_voting_reluctance_timer();
     }
@@ -1216,6 +1333,78 @@ impl Handler<ClientRequest> for Raft {
                         }
                     })
                     .await;
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Handler<StateMachineResponse> for Raft {
+    async fn handle(&mut self, msg: StateMachineResponse) {
+        match msg {
+            StateMachineResponse::Snapshot(_) => {
+                unimplemented!()
+            }
+
+            StateMachineResponse::SnapshotLoaded => {
+                unimplemented!()
+            }
+
+            StateMachineResponse::Output { data, log_index } => {
+                // TODO: problem when snapshot has already emptied this
+                match self.persistent_state.log.get(log_index).unwrap().content {
+                    LogEntryContent::Command {
+                        client_id,
+                        sequence_num,
+                        ..
+                    } => {
+                        log::info!(
+                                "{}: applied entry {}.",
+                                self.config.self_id,
+                                log_index
+                            );
+                        self.volatile_state.session_management.save_response(
+                            client_id,
+                            sequence_num,
+                            data.clone(),
+                        );
+                        if let ProcessType::Leader {
+                            ref mut client_senders,
+                            ..
+                        } = self.volatile_state.process_type
+                        {
+                            if let Some(client) = client_senders.get_mut(&log_index).take() {
+                                let response =
+                                    ClientRequestResponse::CommandResponse(CommandResponseArgs {
+                                        client_id,
+                                        sequence_num,
+                                        content: CommandResponseContent::CommandApplied {
+                                            output: data,
+                                        },
+                                    });
+
+                                // Here we should also empty awaiting repeated requests that were received
+                                // before the State Machine returned its output.
+                                let awaiting: usize = self.volatile_state.session_management.release_awaiting(&client_id, sequence_num);
+                                for _ in 0..awaiting {
+                                    let _ = client.send(response.clone()).await;
+                                    log::debug!(
+                                        "{}: sent response to client {}: {:?}",
+                                        self.config.self_id,
+                                        client_id,
+                                        response
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    LogEntryContent::Configuration { .. } => {
+                        unreachable!()
+                    }
+                    LogEntryContent::RegisterClient => {
+                        unreachable!()
+                    }
+                }
             }
         }
     }
