@@ -108,8 +108,7 @@ mod timing {
 mod state_machine_manager {
     mod sessions {
         use crate::ClientSession;
-        // use std::cmp::Reverse;
-        use std::collections::{BinaryHeap, HashMap, HashSet};
+        use std::collections::HashMap;
         use std::time::{Duration, SystemTime};
         use uuid::Uuid;
 
@@ -289,13 +288,14 @@ mod state_machine_manager {
     }
 
     use crate::state_machine_manager::sessions::{Response, SessionManagment};
-    use crate::{LogEntry, LogEntryContent, Raft, StateMachine};
+    use crate::{ClientRequestResponse, LogEntry, LogEntryContent, Raft, StateMachine};
+    use async_channel::Sender;
     use executor::{Handler, ModuleRef};
     use std::time::Duration;
     use uuid::Uuid;
 
     pub enum StateMachineRequest {
-        MakeSnapshot,
+        MakeSnapshot(Sender<ClientRequestResponse>),
         LoadSnapshot(Vec<u8>),
         Entry((usize, LogEntry)),
     }
@@ -306,7 +306,7 @@ mod state_machine_manager {
     }
 
     pub enum StateMachineResponse {
-        Snapshot(Vec<u8>),
+        Snapshot(Sender<ClientRequestResponse>, Option<Vec<u8>>),
         SnapshotLoaded,
         ClientRegistered {
             log_index: usize,
@@ -322,6 +322,7 @@ mod state_machine_manager {
         session_management: SessionManagment,
         state_machine: Box<dyn StateMachine>,
         raft_ref: ModuleRef<Raft>,
+        has_something_to_snapshot: bool,
     }
 
     impl StateMachineManager {
@@ -335,6 +336,7 @@ mod state_machine_manager {
                 session_management: SessionManagment::new(self_id, session_expiration),
                 state_machine,
                 raft_ref,
+                has_something_to_snapshot: true, // TODO: settle on initial value of this
             }
         }
     }
@@ -343,11 +345,18 @@ mod state_machine_manager {
     impl Handler<StateMachineRequest> for StateMachineManager {
         async fn handle(&mut self, msg: StateMachineRequest) {
             match msg {
-                StateMachineRequest::MakeSnapshot => {
-                    let snapshot = self.state_machine.serialize().await;
+                StateMachineRequest::MakeSnapshot(for_whom) => {
                     self.raft_ref
-                        .send(StateMachineResponse::Snapshot(snapshot))
+                        .send(StateMachineResponse::Snapshot(
+                            for_whom,
+                            if self.has_something_to_snapshot {
+                                Some(self.state_machine.serialize().await)
+                            } else {
+                                None
+                            },
+                        ))
                         .await;
+                    self.has_something_to_snapshot = false;
                 }
                 StateMachineRequest::LoadSnapshot(snapshot) => {
                     self.state_machine.initialize(snapshot.as_slice()).await;
@@ -362,6 +371,7 @@ mod state_machine_manager {
                         sequence_num,
                         lowest_sequence_num_without_response,
                     } => {
+                        self.has_something_to_snapshot = true;
                         self.session_management.expire_too_old(log_entry.timestamp);
 
                         // log::debug!("{}: Applying {:?}", self.self_id, log_entry);
@@ -483,6 +493,8 @@ impl Default for ProcessType {
 struct Log {
     first_index: usize,
     entries: Vec<LogEntry>,
+    prev_term: u64,
+    prev_config: HashSet<Uuid>,
 }
 
 impl Log {
@@ -490,10 +502,14 @@ impl Log {
         Self {
             first_index: 0,
             entries: vec![LogEntry {
-                content: LogEntryContent::Configuration { servers },
+                content: LogEntryContent::Configuration {
+                    servers: servers.clone(),
+                },
                 term: 0,
                 timestamp,
             }],
+            prev_term: 0,
+            prev_config: servers,
         }
     }
 
@@ -501,16 +517,15 @@ impl Log {
         self.first_index + self.entries.len() - 1
     }
 
-    pub fn has_index(&self, i: usize) -> bool {
-        self.first_index <= i && i <= self.last_index()
+    pub fn entry_already_snapshotted(&self, i: usize) -> bool {
+        i < self.first_index
     }
 
     pub fn stamp(&self) -> LogStamp {
         LogStamp(
             self.entries
                 .last()
-                .map(|log_entry| log_entry.term)
-                .unwrap(),
+                .map_or(self.prev_term, |log_entry| log_entry.term),
             self.last_index() + 1,
         )
     }
@@ -527,7 +542,8 @@ impl Log {
         if range.is_empty() {
             vec![]
         } else {
-            self.entries[(range.start() - self.first_index) ..= (range.end() - self.first_index)].to_vec()
+            self.entries[(range.start() - self.first_index)..=(range.end() - self.first_index)]
+                .to_vec()
         }
     }
 
@@ -540,15 +556,22 @@ impl Log {
         self.entries.push(new_entry);
     }
 
-    pub async fn make_snapshot(
+    pub async fn save_snapshot(
         &mut self,
         stable_storage: &mut dyn StableStorage,
-        state_machine: &mut dyn StateMachine,
+        config: HashSet<Uuid>,
         last_snapshotted_log_entry_index: usize,
+        snapshot: Vec<u8>,
     ) {
         stable_storage
-            .put(SNAPSHOT_KEYNAME, state_machine.serialize().await.as_slice())
-            .await.unwrap();
+            .put(SNAPSHOT_KEYNAME, snapshot.as_slice())
+            .await
+            .unwrap();
+        self.prev_term = self.entries.last().unwrap().term;
+        self.entries
+            .drain(..=last_snapshotted_log_entry_index - self.first_index);
+        self.first_index = last_snapshotted_log_entry_index + 1;
+        self.prev_config = config;
     }
 }
 
@@ -582,6 +605,7 @@ struct VolatileState {
     process_type: ProcessType,
     commit_index: usize,
     last_applied: usize,
+    last_applied_acked: usize,
     voting_reluctant: bool,
 }
 
@@ -591,6 +615,7 @@ impl VolatileState {
             process_type: Default::default(),
             commit_index: 0,
             last_applied: 0,
+            last_applied_acked: 0,
             voting_reluctant: false,
         }
     }
@@ -614,25 +639,43 @@ impl Raft {
     /// returns a `ModuleRef` to it.
     pub async fn new(
         system: &mut System,
-        config: ServerConfig,
+        mut config: ServerConfig,
         first_log_entry_timestamp: SystemTime,
-        state_machine: Box<dyn StateMachine>,
+        mut state_machine: Box<dyn StateMachine>,
         stable_storage: Box<dyn StableStorage>,
         message_sender: Box<dyn RaftSender>,
     ) -> ModuleRef<Self> {
         let self_id = config.self_id;
         let session_expiration = config.session_expiration;
+        log::debug!("{}: Initializing Raft.", self_id);
         let election_timeout_range = config.election_timeout_range.clone();
+        let persistent_state = stable_storage
+            .get(STATE_KEYNAME)
+            .await
+            .map(|x| bincode::deserialize(x.as_slice()).unwrap())
+            .unwrap_or(PersistentState::new(
+                first_log_entry_timestamp,
+                config.servers.clone(),
+            ));
+
+        // Check if snapshot must be loaded
+        if persistent_state.log.first_index != 0 {
+            config.servers = persistent_state.log.prev_config.clone();
+
+            state_machine
+                .initialize(
+                    stable_storage
+                        .get(SNAPSHOT_KEYNAME)
+                        .await
+                        .unwrap_or_else(|| panic!("Snapshot file not present while required!"))
+                        .as_slice(),
+                )
+                .await;
+        }
+
         let self_ref = system
             .register_module(Self {
-                persistent_state: stable_storage
-                    .get(STATE_KEYNAME)
-                    .await
-                    .map(|x| bincode::deserialize(x.as_slice()).unwrap())
-                    .unwrap_or(PersistentState::new(
-                        first_log_entry_timestamp,
-                        config.servers.clone(),
-                    )),
+                persistent_state,
                 volatile_state: VolatileState::new(),
                 config,
                 stable_storage,
@@ -661,6 +704,7 @@ impl Raft {
                 state_machine_ref,
             })
             .await;
+        log::info!("{}: Initialized Raft.", self_id);
         self_ref
     }
 
@@ -772,27 +816,45 @@ impl Raft {
     }
 
     async fn replicate_log_to(&self, next_index: usize, server: Uuid) {
-        if !self.persistent_state.log.has_index(next_index) {
+        if self
+            .persistent_state
+            .log
+            .entry_already_snapshotted(next_index)
+        {
             // InstallSnapshot
+            self.send_msg_to(
+                &server,
+                RaftMessageContent::InstallSnapshot(InstallSnapshotArgs {
+                    last_included_index: 0,
+                    last_included_term: 0,
+                    last_config: None,
+                    client_sessions: None,
+                    offset: 0,
+                    data: vec![],
+                    done: false,
+                }),
+            )
+            .await;
         } else {
             // AppendEntries
+            let prev_log_index = next_index - 1;
+            self.send_msg_to(
+                &server,
+                RaftMessageContent::AppendEntries(AppendEntriesArgs {
+                    prev_log_index,
+                    prev_log_term: self.persistent_state.log.get(prev_log_index).unwrap().term,
+                    entries: self.persistent_state.log.subvec(
+                        next_index
+                            ..=usize::min(
+                                self.persistent_state.log.last_index(),
+                                prev_log_index + self.config.append_entries_batch_size,
+                            ),
+                    ),
+                    leader_commit: self.volatile_state.commit_index,
+                }),
+            )
+            .await;
         }
-
-        let prev_log_index = next_index - 1;
-        self.send_msg_to(
-            &server,
-            RaftMessageContent::AppendEntries(AppendEntriesArgs {
-                prev_log_index,
-                prev_log_term: self.persistent_state.log.get(prev_log_index).unwrap().term,
-                entries: self.persistent_state.log.subvec(next_index
-                    ..=usize::min(
-                        self.persistent_state.log.last_index(),
-                        prev_log_index + self.config.append_entries_batch_size,
-                    )),
-                leader_commit: self.volatile_state.commit_index,
-            }),
-        )
-        .await;
     }
 
     async fn replicate_log(
@@ -809,11 +871,14 @@ impl Raft {
     async fn try_become_leader(&mut self, votes_received: usize) {
         if votes_received > self.config.servers.len() / 2 {
             // become the leader
-            self.volatile_state.process_type =
-                ProcessType::new_leader(&self.config.servers,
-                                        self.persistent_state.log.last_index());
+            log::info!("{}: was elected leader!", self.config.self_id);
+
+            self.volatile_state.process_type = ProcessType::new_leader(
+                &self.config.servers,
+                self.persistent_state.log.last_index(),
+            );
             self.persistent_state.leader_id = Some(self.config.self_id);
-            self.persistent_state.voted_for = None;
+            self.persistent_state.voted_for = Some(self.config.self_id);
             self.update_state().await;
 
             match &self.volatile_state.process_type {
@@ -836,8 +901,6 @@ impl Raft {
                     *self.config.election_timeout_range.start() / 10,
                 ),
             };
-
-            log::info!("{}: was elected leader!", self.config.self_id);
         }
     }
 
@@ -846,7 +909,9 @@ impl Raft {
             ProcessType::Leader {
                 ref match_index, ..
             } => {
-                for i in (self.volatile_state.commit_index + 1)..=self.persistent_state.log.last_index() {
+                for i in
+                    (self.volatile_state.commit_index + 1)..=self.persistent_state.log.last_index()
+                {
                     if match_index.values().filter(|&val| *val >= i).count()
                         > self.config.servers.len() / 2
                     {
@@ -876,7 +941,11 @@ impl Raft {
         while self.volatile_state.commit_index > self.volatile_state.last_applied {
             self.volatile_state.last_applied += 1;
             let currently_applied_idx = self.volatile_state.last_applied;
-            let newly_commited_entry = self.persistent_state.log.get(currently_applied_idx).unwrap();
+            let newly_commited_entry = self
+                .persistent_state
+                .log
+                .get(currently_applied_idx)
+                .unwrap();
 
             self.state_machine_ref
                 .as_ref()
@@ -922,7 +991,10 @@ impl Raft {
         self.handle_heartbeat(leader_id).await;
 
         // Update log
-        let success = self.persistent_state.log.get(content.prev_log_index)
+        let success = self
+            .persistent_state
+            .log
+            .get(content.prev_log_index)
             .map_or(false, |entry| entry.term == content.prev_log_term);
         if success {
             let first_new_entry_index = content.prev_log_index + 1;
@@ -933,8 +1005,11 @@ impl Raft {
                     }
                     Some(_) => {
                         // Overwrite existing entries with the leader's.
-                        *self.persistent_state.log.get_mut(first_new_entry_index + i).unwrap() =
-                            content.entries[i].clone();
+                        *self
+                            .persistent_state
+                            .log
+                            .get_mut(first_new_entry_index + i)
+                            .unwrap() = content.entries[i].clone();
                         self.persistent_state
                             .log
                             .truncate(first_new_entry_index + i);
@@ -955,8 +1030,10 @@ impl Raft {
 
         self.update_state().await;
 
-        self.volatile_state.commit_index =
-            usize::min(content.leader_commit, self.persistent_state.log.last_index());
+        self.volatile_state.commit_index = usize::min(
+            content.leader_commit,
+            self.persistent_state.log.last_index(),
+        );
 
         // Respond to leader
         self.send_msg_to(
@@ -989,8 +1066,8 @@ impl Raft {
                 if content.success {
                     *match_index.get_mut(&header.source).unwrap() = content.last_log_index;
                     *next_index.get_mut(&header.source).unwrap() = content.last_log_index + 1;
-                    let should_resend_append_entries =
-                        *next_index.get(&header.source).unwrap() <= self.persistent_state.log.last_index();
+                    let should_resend_append_entries = *next_index.get(&header.source).unwrap()
+                        <= self.persistent_state.log.last_index();
                     self.try_commit();
                     self.try_apply().await;
 
@@ -1015,7 +1092,8 @@ impl Raft {
             );
             match self.volatile_state.process_type {
                 ProcessType::Leader { ref next_index, .. } => {
-                    self.replicate_log_to(next_index[&header.source], header.source).await;
+                    self.replicate_log_to(next_index[&header.source], header.source)
+                        .await;
                 }
                 _ => unreachable!(),
             }
@@ -1081,20 +1159,27 @@ impl Raft {
         }
     }
 
-    async fn make_snapshot(&mut self) {
-        assert_eq!(
-            self.volatile_state.commit_index,
-            self.volatile_state.last_applied
-        );
-        // self.persistent_state
-        //     .log
-        //     .make_snapshot(
-        //         &mut *self.stable_storage,
-        //         &mut *self.state_machine,
-        //         self.volatile_state.commit_index,
-        //     )
-        //     .await;
+    async fn make_snapshot(&mut self, for_whom: Sender<ClientRequestResponse>) {
+        self.state_machine_ref
+            .as_ref()
+            .unwrap()
+            .send(StateMachineRequest::MakeSnapshot(for_whom))
+            .await;
+    }
 
+    async fn handle_install_snapshot(
+        &self,
+        header: RaftMessageHeader,
+        content: InstallSnapshotArgs,
+    ) {
+        todo!()
+    }
+
+    async fn handle_install_snapshot_response(
+        &self,
+        header: RaftMessageHeader,
+        content: InstallSnapshotResponseArgs,
+    ) {
         todo!()
     }
 }
@@ -1237,11 +1322,30 @@ impl Handler<RaftMessage> for Raft {
                 } // otherwise, regard this message as obsolete and ignore it
             }
 
-            RaftMessageContent::InstallSnapshot(_) => {
-                unimplemented!()
+            RaftMessageContent::InstallSnapshot(args) => {
+                if msg.header.term >= self.persistent_state.current_term {
+                    self.handle_install_snapshot(msg.header, args).await;
+                } else {
+                    // otherwise, regard this message as obsolete and reject it
+                    self.send_msg_to(
+                        &msg.header.source,
+                        RaftMessageContent::InstallSnapshotResponse(InstallSnapshotResponseArgs {
+                            last_included_index: 0,
+                            offset: 0,
+                        }),
+                    )
+                    .await;
+                    todo!() // TODO: very strange. No message suitable for Rejected
+                }
+                todo!()
             }
-            RaftMessageContent::InstallSnapshotResponse(_) => {
-                unimplemented!()
+
+            RaftMessageContent::InstallSnapshotResponse(args) => {
+                if msg.header.term >= self.persistent_state.current_term {
+                    self.handle_install_snapshot_response(msg.header, args)
+                        .await;
+                } // otherwise, regard this message as obsolete and ignore it
+                todo!()
             }
         }
     }
@@ -1251,7 +1355,11 @@ impl Handler<RaftMessage> for Raft {
 impl Handler<ClientRequest> for Raft {
     async fn handle(&mut self, msg: ClientRequest) {
         if let ClientRequestContent::Snapshot = msg.content {
-            self.make_snapshot().await;
+            log::info!(
+                "{}: received request from client: Snapshot",
+                self.config.self_id,
+            );
+            self.make_snapshot(msg.reply_to).await;
         } else {
             match self.volatile_state.process_type {
                 ProcessType::Leader {
@@ -1287,15 +1395,19 @@ impl Handler<ClientRequest> for Raft {
                             );
                             client_senders.insert(entry_index, msg.reply_to);
                         }
+
                         ClientRequestContent::Snapshot => {
                             unreachable!()
                         }
+
                         ClientRequestContent::AddServer { .. } => {
                             unimplemented!()
                         }
+
                         ClientRequestContent::RemoveServer { .. } => {
                             unimplemented!()
                         }
+
                         ClientRequestContent::RegisterClient => {
                             // When a RegisterClient client request (src/domain.rs) is received, your implementation
                             // shall commit a RegisterClient log entry (src/domain.rs), and reply with this entry’s
@@ -1364,8 +1476,35 @@ impl Handler<ClientRequest> for Raft {
 impl Handler<StateMachineResponse> for Raft {
     async fn handle(&mut self, msg: StateMachineResponse) {
         match msg {
-            StateMachineResponse::Snapshot(_) => {
-                unimplemented!()
+            StateMachineResponse::Snapshot(for_whom, snapshot) => {
+                let response = ClientRequestResponse::SnapshotResponse(SnapshotResponseArgs {
+                    content: match snapshot {
+                        None => SnapshotResponseContent::NothingToSnapshot {
+                            last_included_index: self.volatile_state.last_applied_acked,
+                        },
+                        Some(snapshot) => {
+                            self.persistent_state
+                                .log
+                                .save_snapshot(
+                                    &mut *self.stable_storage,
+                                    self.config.servers.clone(),
+                                    self.volatile_state.last_applied_acked,
+                                    snapshot.clone(),
+                                )
+                                .await;
+                            self.update_state().await;
+                            SnapshotResponseContent::SnapshotCreated {
+                                last_included_index: self.volatile_state.commit_index,
+                            }
+                        }
+                    },
+                });
+                log::debug!(
+                    "{}: sent response to client: {:?}",
+                    self.config.self_id,
+                    response
+                );
+                let _ = for_whom.send(response).await;
             }
 
             StateMachineResponse::SnapshotLoaded => {
@@ -1373,6 +1512,7 @@ impl Handler<StateMachineResponse> for Raft {
             }
 
             StateMachineResponse::CommandOutcome { log_index, output } => {
+                self.volatile_state.last_applied_acked += 1;
                 // TODO: problem when snapshot has already emptied this
                 match self.persistent_state.log.get(log_index).unwrap().content {
                     LogEntryContent::Command {

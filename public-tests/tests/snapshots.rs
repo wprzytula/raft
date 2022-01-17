@@ -15,7 +15,7 @@ use assignment_3_test_utils::*;
 fn logger_init() {
     let _ = env_logger::builder()
         .format_timestamp(None)
-        .filter_level(log::LevelFilter::Debug)
+        .filter_level(log::LevelFilter::Trace)
         // .is_test(true)
         .try_init();
 }
@@ -250,7 +250,7 @@ async fn state_machine_is_initialized_with_snapshot() {
         Box::new(sender.clone()),
     )
     .await;
-
+    log::trace!("Second system leader created.");
     // then
     assert_eq!(
         init_receiver.recv().await.unwrap(),
