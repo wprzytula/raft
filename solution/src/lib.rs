@@ -1023,6 +1023,8 @@ impl Handler<HeartbeatTimeout> for Raft {
                 ..
             } => {
                 self.replicate_log(match_index, next_index).await;
+                self.try_commit(); // This is especially needed for single-node environments
+                self.try_apply().await;
             }
         }
     }
