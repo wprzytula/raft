@@ -10,9 +10,10 @@ use rand::distributions::{Distribution, Uniform};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::state_machine_manager::{
+    CommandOutput, StateMachineManager, StateMachineRequest, StateMachineResponse,
+};
 pub use domain::*;
-use sessions::Response;
-use sessions::SessionManagment;
 use timing::{ElectionTimeout, HeartbeatTimeout, Timer, VotingReluctanceTimeout};
 
 mod domain;
@@ -22,6 +23,7 @@ const SNAPSHOT_KEYNAME: &str = "snapshot";
 
 struct Init {
     self_ref: ModuleRef<Raft>,
+    state_machine_ref: ModuleRef<StateMachineManager>,
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -103,184 +105,323 @@ mod timing {
     }
 }
 
-mod sessions {
-    use crate::{ClientRequestResponse, ClientSession};
-    use std::cmp::Reverse;
-    use std::collections::{BinaryHeap, HashMap};
-    use std::time::{Duration, SystemTime};
-    use uuid::Uuid;
+mod state_machine_manager {
+    mod sessions {
+        use crate::ClientSession;
+        // use std::cmp::Reverse;
+        use std::collections::{BinaryHeap, HashMap, HashSet};
+        use std::time::{Duration, SystemTime};
+        use uuid::Uuid;
 
-    pub enum Response {
-        NotYetApplied,
-        AlreadyApplied(Vec<u8>),
-        SessionExpired,
-    }
+        pub enum Response {
+            NotYetApplied,
+            AlreadyApplied(Vec<u8>),
+            SessionExpired,
+        }
 
-    impl ClientSession {
-        pub fn new(creation_time: SystemTime) -> Self {
-            Self {
-                last_activity: creation_time,
-                lowest_sequence_num_without_response: 0,
-                responses: Default::default(),
+        impl ClientSession {
+            pub fn new(creation_time: SystemTime) -> Self {
+                Self {
+                    last_activity: creation_time,
+                    lowest_sequence_num_without_response: 0,
+                    responses: Default::default(),
+                }
             }
-        }
 
-        pub fn save_response(&mut self, sequence_id: u64, response: Vec<u8>) {
-            self.responses.insert(sequence_id, response);
-        }
+            pub fn save_response(&mut self, sequence_id: u64, response: Vec<u8>) {
+                self.responses.insert(sequence_id, response);
+            }
 
-        pub fn reuse_response(&self, sequence_num: u64) -> Response {
-            if self.lowest_sequence_num_without_response > sequence_num {
-                Response::SessionExpired
-            } else {
-                match self.responses.get(&sequence_num) {
-                    None => Response::NotYetApplied,
-                    Some(response) => Response::AlreadyApplied(response.clone()),
+            pub fn reuse_response(&self, sequence_num: u64) -> Response {
+                if self.lowest_sequence_num_without_response > sequence_num {
+                    Response::SessionExpired
+                } else {
+                    match self.responses.get(&sequence_num) {
+                        None => Response::NotYetApplied,
+                        Some(response) => Response::AlreadyApplied(response.clone()),
+                    }
+                }
+            }
+
+            pub fn remove_acknowledged_lower_than(
+                &mut self,
+                lowest_sequence_num_without_response: u64,
+            ) {
+                if self.lowest_sequence_num_without_response < lowest_sequence_num_without_response
+                {
+                    let len_before = self.responses.len();
+                    self.responses
+                        .retain(|&k, _v| k >= lowest_sequence_num_without_response);
+                    let len_after = self.responses.len();
+                    log::debug!(
+                        "Removed {} acknowledged response(s). (self={}, new={})",
+                        len_before - len_after,
+                        self.lowest_sequence_num_without_response,
+                        lowest_sequence_num_without_response
+                    );
+
+                    self.lowest_sequence_num_without_response =
+                        lowest_sequence_num_without_response;
                 }
             }
         }
 
-        pub fn remove_acknowledged_lower_than(
-            &mut self,
-            lowest_sequence_num_without_response: u64,
-        ) {
-            if self.lowest_sequence_num_without_response < lowest_sequence_num_without_response {
-                let len_before = self.responses.len();
-                self.responses
-                    .retain(|&k, _v| k >= lowest_sequence_num_without_response);
-                let len_after = self.responses.len();
-                log::debug!(
-                    "Removed {} acknowledged response(s). (self={}, new={})",
-                    len_before - len_after,
-                    self.lowest_sequence_num_without_response,
-                    lowest_sequence_num_without_response
-                );
+        pub struct SessionManagment {
+            self_id: Uuid,
+            session_expiration: Duration,
+            // This nested HashMap is number of repeated requests awaiting for State Machine
+            // application of the command, per sequence_num.
+            sessions: HashMap<Uuid, ClientSession>,
+            // last_activities: BinaryHeap<Reverse<(SystemTime, Uuid)>>,
+        }
 
-                self.lowest_sequence_num_without_response = lowest_sequence_num_without_response;
+        impl SessionManagment {
+            pub fn new(self_id: Uuid, session_expiration: Duration) -> Self {
+                Self {
+                    self_id,
+                    session_expiration,
+                    sessions: Default::default(),
+                    // last_activities: Default::default(),
+                }
             }
-        }
-    }
 
-    pub struct SessionManagment {
-        self_id: Uuid,
-        session_expiration: Duration,
-        sessions: HashMap<Uuid, ClientSession>,
-        // last_activities: BinaryHeap<Reverse<(SystemTime, Uuid)>>,
-    }
-
-    impl SessionManagment {
-        pub fn new(self_id: Uuid, session_expiration: Duration) -> Self {
-            Self {
-                self_id,
-                session_expiration,
-                sessions: Default::default(),
-                // last_activities: Default::default(),
-            }
-        }
-
-        pub fn new_session(&mut self, client_id: Uuid, creation_time: SystemTime) {
-            self.sessions.insert(client_id, ClientSession::new(creation_time));
-            // self.last_activities.push(Reverse((creation_time, client_id)));
-            log::debug!(
-                "{}: Initialized session for client: {}",
-                self.self_id,
-                client_id
-            );
-        }
-
-        pub fn new_activity(
-            &mut self,
-            client_id: Uuid,
-            timestamp: SystemTime,
-            lowest_sequence_num_without_response: u64,
-        ) {
-            if let Some(session) = self.sessions.get_mut(&client_id) {
-                log::debug!("{}: New activity of client: {}", self.self_id, client_id);
-                session.remove_acknowledged_lower_than(lowest_sequence_num_without_response);
-                session.last_activity = timestamp;
-                // self.last_activities.push(Reverse((timestamp, client_id)));
-            } else {
+            pub fn new_session(&mut self, client_id: Uuid, creation_time: SystemTime) {
+                self.sessions
+                    .insert(client_id, ClientSession::new(creation_time));
+                // self.last_activities.push(Reverse((creation_time, client_id)));
                 log::debug!(
-                    "{}: New activity of expired client!: {}",
+                    "{}: Initialized session for client: {}",
                     self.self_id,
                     client_id
                 );
             }
-        }
 
-        pub fn save_response(
-            &mut self,
-            client_id: Uuid,
-            sequence_id: u64,
-            response: Vec<u8>,
-        ) {
-            log::debug!(
-                "{}: Saved response for retransmissions: {:?}",
-                self.self_id,
-                response
-            );
-            self.sessions
-                .get_mut(&client_id)
-                .unwrap()
-                .save_response(sequence_id, response);
-        }
-
-        pub fn reuse_response(&self, client_id: &Uuid, sequence_num: u64) -> Response {
-            self.sessions
-                .get(client_id)
-                .map_or(Response::SessionExpired, |session| {
-                    session.reuse_response(sequence_num)
-                })
-        }
-
-        pub fn expire_too_old(&mut self, current_time: SystemTime) {
-            for expired_client in self
-                .sessions
-                .iter()
-                .filter_map(|(&client_id, session)| {
-                    log::trace!(
-                        "Last activity ({:?}) + expiration ({:?}) < current_time ({:?}) ",
-                        session.last_activity,
-                        self.session_expiration,
-                        current_time
-                    );
-                    if session.last_activity + self.session_expiration < current_time {
-                        Some(client_id)
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<Uuid>>()
-            {
-                self.sessions.remove(&expired_client).unwrap();
-                log::info!(
-                    "{}: Expired client session: {}",
+            pub fn save_response(&mut self, client_id: Uuid, sequence_id: u64, response: Vec<u8>) {
+                log::debug!(
+                    "{}: Saved response for retransmissions: {:?}",
                     self.self_id,
-                    expired_client
+                    response
                 );
+                self.sessions
+                    .get_mut(&client_id)
+                    .unwrap()
+                    .save_response(sequence_id, response);
             }
-            // while self
-            //     .last_activities
-            //     .peek()
-            //     .map_or(false, |&Reverse((old_time, _))| {
-            //         old_time + self.session_expiration < current_time
-            //     })
-            // {
-            //     // Client session possibly expired, check it:
-            //     let Reverse((_, client_that_possibly_expired)) =
-            //         self.last_activities.pop().unwrap();
-            //     if self
-            //         .sessions
-            //         .get(&client_that_possibly_expired)
-            //         .map_or(false, |session| {
-            //             session.last_activity + self.session_expiration < current_time
-            //         })
-            //     {
-            //         // Session truly expired.
-            //         self.sessions.remove(&client_that_possibly_expired).unwrap();
-            //         log::warn!("{}: Expired client session: {}", self.self_id, client_that_possibly_expired);
-            //     }
-            // }
+
+            pub fn reuse_response(&self, client_id: &Uuid, sequence_num: u64) -> Response {
+                self.sessions
+                    .get(client_id)
+                    .map_or(Response::SessionExpired, |session| {
+                        session.reuse_response(sequence_num)
+                    })
+            }
+
+            pub fn new_activity(
+                &mut self,
+                client_id: Uuid,
+                timestamp: SystemTime,
+                lowest_sequence_num_without_response: u64,
+            ) {
+                if let Some(session) = self.sessions.get_mut(&client_id) {
+                    log::debug!("{}: New activity of client: {}", self.self_id, client_id);
+                    session.remove_acknowledged_lower_than(lowest_sequence_num_without_response);
+                    session.last_activity = timestamp;
+                    // self.last_activities.push(Reverse((timestamp, client_id)));
+                } else {
+                    log::debug!(
+                        "{}: New activity of expired client!: {}",
+                        self.self_id,
+                        client_id
+                    );
+                }
+            }
+
+            pub fn expire_too_old(&mut self, current_time: SystemTime) {
+                for expired_client in self
+                    .sessions
+                    .iter()
+                    .filter_map(|(&client_id, session)| {
+                        log::trace!(
+                            "Last activity ({:?}) + expiration ({:?}) < current_time ({:?}) ",
+                            session.last_activity,
+                            self.session_expiration,
+                            current_time
+                        );
+                        if session.last_activity + self.session_expiration < current_time {
+                            Some(client_id)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<Uuid>>()
+                {
+                    self.sessions.remove(&expired_client).unwrap();
+                    log::info!(
+                        "{}: Expired client session: {}",
+                        self.self_id,
+                        expired_client
+                    );
+                }
+                // while self
+                //     .last_activities
+                //     .peek()
+                //     .map_or(false, |&Reverse((old_time, _))| {
+                //         old_time + self.session_expiration < current_time
+                //     })
+                // {
+                //     // Client session possibly expired, check it:
+                //     let Reverse((_, client_that_possibly_expired)) =
+                //         self.last_activities.pop().unwrap();
+                //     if self
+                //         .sessions
+                //         .get(&client_that_possibly_expired)
+                //         .map_or(false, |session| {
+                //             session.last_activity + self.session_expiration < current_time
+                //         })
+                //     {
+                //         // Session truly expired.
+                //         self.sessions.remove(&client_that_possibly_expired).unwrap();
+                //         log::warn!("{}: Expired client session: {}", self.self_id, client_that_possibly_expired);
+                //     }
+                // }
+            }
+        }
+    }
+
+    use crate::state_machine_manager::sessions::{Response, SessionManagment};
+    use crate::{LogEntry, LogEntryContent, Raft, StateMachine};
+    use executor::{Handler, ModuleRef};
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    pub enum StateMachineRequest {
+        MakeSnapshot,
+        LoadSnapshot(Vec<u8>),
+        Entry((usize, LogEntry)),
+    }
+
+    pub enum CommandOutput {
+        CommandApplied { data: Vec<u8> },
+        SessionExpired,
+    }
+
+    pub enum StateMachineResponse {
+        Snapshot(Vec<u8>),
+        SnapshotLoaded,
+        ClientRegistered {
+            log_index: usize,
+            client_id: Uuid,
+        },
+        CommandOutcome {
+            log_index: usize,
+            output: CommandOutput,
+        },
+    }
+
+    pub struct StateMachineManager {
+        session_management: SessionManagment,
+        state_machine: Box<dyn StateMachine>,
+        raft_ref: ModuleRef<Raft>,
+    }
+
+    impl StateMachineManager {
+        pub fn new(
+            state_machine: Box<dyn StateMachine>,
+            raft_ref: ModuleRef<Raft>,
+            self_id: Uuid,
+            session_expiration: Duration,
+        ) -> Self {
+            Self {
+                session_management: SessionManagment::new(self_id, session_expiration),
+                state_machine,
+                raft_ref,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Handler<StateMachineRequest> for StateMachineManager {
+        async fn handle(&mut self, msg: StateMachineRequest) {
+            match msg {
+                StateMachineRequest::MakeSnapshot => {
+                    let snapshot = self.state_machine.serialize().await;
+                    self.raft_ref
+                        .send(StateMachineResponse::Snapshot(snapshot))
+                        .await;
+                }
+                StateMachineRequest::LoadSnapshot(snapshot) => {
+                    self.state_machine.initialize(snapshot.as_slice()).await;
+                    self.raft_ref
+                        .send(StateMachineResponse::SnapshotLoaded)
+                        .await;
+                }
+                StateMachineRequest::Entry((log_index, log_entry)) => match log_entry.content {
+                    LogEntryContent::Command {
+                        ref data,
+                        client_id,
+                        sequence_num,
+                        lowest_sequence_num_without_response,
+                    } => {
+                        self.session_management.expire_too_old(log_entry.timestamp);
+
+                        // log::debug!("{}: Applying {:?}", self.self_id, log_entry);
+
+                        self.session_management.new_activity(
+                            client_id,
+                            log_entry.timestamp,
+                            lowest_sequence_num_without_response,
+                        );
+
+                        // check if this command hasn't been applied yet
+                        let output = match self
+                            .session_management
+                            .reuse_response(&client_id, sequence_num)
+                        {
+                            Response::NotYetApplied => {
+                                let output = self.state_machine.apply(data.as_slice()).await;
+                                log::debug!("State machine has applied another command.");
+                                CommandOutput::CommandApplied { data: output }
+                            }
+                            Response::AlreadyApplied(output) => {
+                                CommandOutput::CommandApplied { data: output }
+                            }
+                            Response::SessionExpired => CommandOutput::SessionExpired,
+                        };
+
+                        if let CommandOutput::CommandApplied { ref data } = output {
+                            self.session_management.save_response(
+                                client_id,
+                                sequence_num,
+                                data.clone(),
+                            );
+                            // log::info!(
+                            //     "{}: applied entry {}.",
+                            //     self.self_id,
+                            //     currently_applied_idx
+                            // );
+                        }
+
+                        self.raft_ref
+                            .send(StateMachineResponse::CommandOutcome { log_index, output })
+                            .await;
+                    }
+                    LogEntryContent::Configuration { .. } => {
+                        unreachable!()
+                    }
+                    LogEntryContent::RegisterClient => {
+                        let client_id = Uuid::from_u128(log_index as u128);
+                        self.session_management
+                            .new_session(client_id, log_entry.timestamp);
+
+                        self.raft_ref
+                            .send(StateMachineResponse::ClientRegistered {
+                                log_index,
+                                client_id,
+                            })
+                            .await;
+                    }
+                },
+            }
         }
     }
 }
@@ -442,17 +583,15 @@ struct VolatileState {
     commit_index: usize,
     last_applied: usize,
     voting_reluctant: bool,
-    session_management: SessionManagment,
 }
 
 impl VolatileState {
-    pub fn new(self_id: Uuid, session_expiration: Duration) -> Self {
+    pub fn new() -> Self {
         Self {
             process_type: Default::default(),
             commit_index: 0,
             last_applied: 0,
             voting_reluctant: false,
-            session_management: SessionManagment::new(self_id, session_expiration),
         }
     }
 }
@@ -461,10 +600,10 @@ pub struct Raft {
     persistent_state: PersistentState,
     volatile_state: VolatileState,
     config: ServerConfig,
-    state_machine: Box<dyn StateMachine>,
     stable_storage: Box<dyn StableStorage>,
     message_sender: Box<dyn RaftSender>,
     self_ref: Option<ModuleRef<Raft>>,
+    state_machine_ref: Option<ModuleRef<StateMachineManager>>,
     election_timer: Timer<ElectionTimeout>,
     election_timeout_randomizer: Uniform<Duration>,
     voting_reluctance_timer: Timer<VotingReluctanceTimeout>,
@@ -481,6 +620,8 @@ impl Raft {
         stable_storage: Box<dyn StableStorage>,
         message_sender: Box<dyn RaftSender>,
     ) -> ModuleRef<Self> {
+        let self_id = config.self_id;
+        let session_expiration = config.session_expiration;
         let election_timeout_range = config.election_timeout_range.clone();
         let self_ref = system
             .register_module(Self {
@@ -492,12 +633,12 @@ impl Raft {
                         first_log_entry_timestamp,
                         config.servers.clone(),
                     )),
-                volatile_state: VolatileState::new(config.self_id, config.session_expiration),
+                volatile_state: VolatileState::new(),
                 config,
-                state_machine,
                 stable_storage,
                 message_sender,
                 self_ref: None,
+                state_machine_ref: None,
                 election_timer: Timer::new(),
                 election_timeout_randomizer: Uniform::new_inclusive(
                     election_timeout_range.start(),
@@ -506,9 +647,18 @@ impl Raft {
                 voting_reluctance_timer: Timer::new(),
             })
             .await;
+        let state_machine_ref = system
+            .register_module(StateMachineManager::new(
+                state_machine,
+                self_ref.clone(),
+                self_id,
+                session_expiration,
+            ))
+            .await;
         self_ref
             .send(Init {
                 self_ref: self_ref.clone(),
+                state_machine_ref,
             })
             .await;
         self_ref
@@ -726,122 +876,16 @@ impl Raft {
         while self.volatile_state.commit_index > self.volatile_state.last_applied {
             self.volatile_state.last_applied += 1;
             let currently_applied_idx = self.volatile_state.last_applied;
-            let newly_commited_entry = &self.persistent_state.log.get(currently_applied_idx).unwrap();
+            let newly_commited_entry = self.persistent_state.log.get(currently_applied_idx).unwrap();
 
-            self.volatile_state
-                .session_management
-                .expire_too_old(newly_commited_entry.timestamp);
-
-            log::debug!(
-                "{}: Applying {:?}",
-                self.config.self_id,
-                newly_commited_entry
-            );
-
-            match newly_commited_entry.content {
-                LogEntryContent::Command {
-                    ref data,
-                    client_id,
-                    sequence_num,
-                    lowest_sequence_num_without_response,
-                } => {
-                    self.volatile_state.session_management.new_activity(
-                        client_id,
-                        newly_commited_entry.timestamp,
-                        lowest_sequence_num_without_response,
-                    );
-
-                    // check if this command hasn't been applied yet
-                    let response = match self
-                        .volatile_state
-                        .session_management
-                        .reuse_response(&client_id, sequence_num)
-                    {
-                        Response::NotYetApplied => {
-                            let output = self.state_machine.apply(data.as_slice()).await;
-                            self.volatile_state.session_management.save_response(
-                                client_id,
-                                sequence_num,
-                                output.clone(),
-                            );
-                            ClientRequestResponse::CommandResponse(CommandResponseArgs {
-                                client_id,
-                                sequence_num,
-                                content: CommandResponseContent::CommandApplied { output },
-                            })
-                        }
-                        Response::AlreadyApplied(output) => {
-                            ClientRequestResponse::CommandResponse(CommandResponseArgs {
-                                client_id,
-                                sequence_num,
-                                content: CommandResponseContent::CommandApplied { output },
-                            })
-                        },
-                        Response::SessionExpired => {
-                            ClientRequestResponse::CommandResponse(CommandResponseArgs {
-                                client_id,
-                                sequence_num,
-                                content: CommandResponseContent::SessionExpired,
-                            })
-                        }
-                    };
-
-                    if let ProcessType::Leader {
-                        ref mut client_senders,
-                        ..
-                    } = self.volatile_state.process_type
-                    {
-                        if let Some(client) = client_senders.get_mut(&currently_applied_idx).take()
-                        {
-                            log::debug!(
-                                "{}: sent response to client {}: {:?}",
-                                self.config.self_id,
-                                client_id,
-                                response
-                            );
-                            let _ = client.send(response).await;
-                        }
-                    }
-                }
-                LogEntryContent::Configuration { .. } => {
-                    unimplemented!()
-                }
-                LogEntryContent::RegisterClient => {
-                    let client_id = Uuid::from_u128(currently_applied_idx as u128);
-                    self.volatile_state
-                        .session_management
-                        .new_session(client_id, newly_commited_entry.timestamp);
-
-                    if let ProcessType::Leader {
-                        ref mut client_senders,
-                        ..
-                    } = self.volatile_state.process_type
-                    {
-                        if let Some(client) = client_senders.get_mut(&currently_applied_idx).take()
-                        {
-                            let response = ClientRequestResponse::RegisterClientResponse(
-                                RegisterClientResponseArgs {
-                                    content: RegisterClientResponseContent::ClientRegistered {
-                                        client_id,
-                                    },
-                                },
-                            );
-                            log::debug!(
-                                "{}: sent response to client {}: {:?}",
-                                self.config.self_id,
-                                client_id,
-                                response
-                            );
-                            let _ = client.send(response).await;
-                        }
-                    }
-                }
-            }
-            log::info!(
-                "{}: applied entry {}.",
-                self.config.self_id,
-                currently_applied_idx
-            );
+            self.state_machine_ref
+                .as_ref()
+                .unwrap()
+                .send(StateMachineRequest::Entry((
+                    currently_applied_idx,
+                    newly_commited_entry.clone(),
+                )))
+                .await;
         }
     }
 
@@ -1042,14 +1086,14 @@ impl Raft {
             self.volatile_state.commit_index,
             self.volatile_state.last_applied
         );
-        self.persistent_state
-            .log
-            .make_snapshot(
-                &mut *self.stable_storage,
-                &mut *self.state_machine,
-                self.volatile_state.commit_index,
-            )
-            .await;
+        // self.persistent_state
+        //     .log
+        //     .make_snapshot(
+        //         &mut *self.stable_storage,
+        //         &mut *self.state_machine,
+        //         self.volatile_state.commit_index,
+        //     )
+        //     .await;
 
         todo!()
     }
@@ -1059,6 +1103,7 @@ impl Raft {
 impl Handler<Init> for Raft {
     async fn handle(&mut self, msg: Init) {
         self.self_ref = Some(msg.self_ref);
+        self.state_machine_ref = Some(msg.state_machine_ref);
         self.reset_election_timer();
         self.reset_voting_reluctance_timer();
     }
@@ -1111,6 +1156,8 @@ impl Handler<HeartbeatTimeout> for Raft {
                 ..
             } => {
                 self.replicate_log(match_index, next_index).await;
+                self.try_commit(); // This is especially needed for single-node environments
+                self.try_apply().await;
             }
         }
     }
@@ -1307,6 +1354,96 @@ impl Handler<ClientRequest> for Raft {
                             }
                         })
                         .await;
+                }
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Handler<StateMachineResponse> for Raft {
+    async fn handle(&mut self, msg: StateMachineResponse) {
+        match msg {
+            StateMachineResponse::Snapshot(_) => {
+                unimplemented!()
+            }
+
+            StateMachineResponse::SnapshotLoaded => {
+                unimplemented!()
+            }
+
+            StateMachineResponse::CommandOutcome { log_index, output } => {
+                // TODO: problem when snapshot has already emptied this
+                match self.persistent_state.log.get(log_index).unwrap().content {
+                    LogEntryContent::Command {
+                        client_id,
+                        sequence_num,
+                        ..
+                    } => {
+                        if let ProcessType::Leader {
+                            ref mut client_senders,
+                            ..
+                        } = self.volatile_state.process_type
+                        {
+                            if let Some(client) = client_senders.get_mut(&log_index).take() {
+                                let response =
+                                    ClientRequestResponse::CommandResponse(CommandResponseArgs {
+                                        client_id,
+                                        sequence_num,
+                                        content: match output {
+                                            CommandOutput::CommandApplied { data } => {
+                                                CommandResponseContent::CommandApplied {
+                                                    output: data,
+                                                }
+                                            }
+                                            CommandOutput::SessionExpired => {
+                                                CommandResponseContent::SessionExpired
+                                            }
+                                        },
+                                    });
+                                let _ = client.send(response.clone()).await;
+                                log::debug!(
+                                    "{}: sent response to client {}: {:?}",
+                                    self.config.self_id,
+                                    client_id,
+                                    response
+                                );
+                            }
+                        }
+                    }
+                    LogEntryContent::Configuration { .. } => {
+                        unreachable!()
+                    }
+                    LogEntryContent::RegisterClient => {
+                        unreachable!()
+                    }
+                }
+            }
+            StateMachineResponse::ClientRegistered {
+                log_index,
+                client_id,
+            } => {
+                if let ProcessType::Leader {
+                    ref mut client_senders,
+                    ..
+                } = self.volatile_state.process_type
+                {
+                    if let Some(client) = client_senders.get_mut(&log_index).take() {
+                        let response = ClientRequestResponse::RegisterClientResponse(
+                            RegisterClientResponseArgs {
+                                content: RegisterClientResponseContent::ClientRegistered {
+                                    client_id,
+                                },
+                            },
+                        );
+                        log::debug!(
+                            "{}: sent response to client {}: {:?}",
+                            self.config.self_id,
+                            client_id,
+                            response
+                        );
+                        let _ = client.send(response).await;
+                    }
                 }
             }
         }

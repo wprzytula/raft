@@ -4,7 +4,7 @@ version = "0.2.0"
 authors = ["Filip Plata <fp371335@students.mimuw.edu.pl>", "Wojciech Ciszewski <w.ciszewski2@student.uw.edu.pl>"]
 edition = "2021"
 
-    [dependencies]
+[dependencies]
 env_logger = "0.9"
 
 [dev-dependencies]
