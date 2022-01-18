@@ -314,6 +314,8 @@ mod state_machine_manager {
         },
         CommandOutcome {
             log_index: usize,
+            client_id: Uuid,
+            sequence_num: u64,
             output: CommandOutput,
         },
     }
@@ -412,7 +414,7 @@ mod state_machine_manager {
                         }
 
                         self.raft_ref
-                            .send(StateMachineResponse::CommandOutcome { log_index, output })
+                            .send(StateMachineResponse::CommandOutcome { log_index, client_id, sequence_num, output })
                             .await;
                     }
                     LogEntryContent::Configuration { .. } => {
@@ -1335,7 +1337,7 @@ impl Handler<RaftMessage> for Raft {
                         }),
                     )
                     .await;
-                    todo!() // TODO: very strange. No message suitable for Rejected
+                    // TODO: very strange. No message suitable for Rejected
                 }
                 todo!()
             }
@@ -1511,51 +1513,36 @@ impl Handler<StateMachineResponse> for Raft {
                 unimplemented!()
             }
 
-            StateMachineResponse::CommandOutcome { log_index, output } => {
+            StateMachineResponse::CommandOutcome { log_index, output, client_id, sequence_num } => {
                 self.volatile_state.last_applied_acked += 1;
-                // TODO: problem when snapshot has already emptied this
-                match self.persistent_state.log.get(log_index).unwrap().content {
-                    LogEntryContent::Command {
-                        client_id,
-                        sequence_num,
-                        ..
-                    } => {
-                        if let ProcessType::Leader {
-                            ref mut client_senders,
-                            ..
-                        } = self.volatile_state.process_type
-                        {
-                            if let Some(client) = client_senders.get_mut(&log_index).take() {
-                                let response =
-                                    ClientRequestResponse::CommandResponse(CommandResponseArgs {
-                                        client_id,
-                                        sequence_num,
-                                        content: match output {
-                                            CommandOutput::CommandApplied { data } => {
-                                                CommandResponseContent::CommandApplied {
-                                                    output: data,
-                                                }
-                                            }
-                                            CommandOutput::SessionExpired => {
-                                                CommandResponseContent::SessionExpired
-                                            }
-                                        },
-                                    });
-                                let _ = client.send(response.clone()).await;
-                                log::debug!(
-                                    "{}: sent response to client {}: {:?}",
-                                    self.config.self_id,
-                                    client_id,
-                                    response
-                                );
-                            }
-                        }
-                    }
-                    LogEntryContent::Configuration { .. } => {
-                        unreachable!()
-                    }
-                    LogEntryContent::RegisterClient => {
-                        unreachable!()
+                if let ProcessType::Leader {
+                    ref mut client_senders,
+                    ..
+                } = self.volatile_state.process_type
+                {
+                    if let Some(client) = client_senders.get_mut(&log_index).take() {
+                        let response =
+                            ClientRequestResponse::CommandResponse(CommandResponseArgs {
+                                client_id,
+                                sequence_num,
+                                content: match output {
+                                    CommandOutput::CommandApplied { data } => {
+                                        CommandResponseContent::CommandApplied {
+                                            output: data,
+                                        }
+                                    }
+                                    CommandOutput::SessionExpired => {
+                                        CommandResponseContent::SessionExpired
+                                    }
+                                },
+                            });
+                        let _ = client.send(response.clone()).await;
+                        log::debug!(
+                            "{}: sent response to client {}: {:?}",
+                            self.config.self_id,
+                            client_id,
+                            response
+                        );
                     }
                 }
             }
