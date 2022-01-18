@@ -1330,22 +1330,8 @@ impl Raft {
         header: RaftMessageHeader,
         content: InstallSnapshotArgs,
     ) {
-        // if offset = 0
-        //      create new SnapshotTransmission instance and initialize it
-        //      set offset = new_offset
-        // else
-        //      if SnapshotTransmission exists and last_index is coherent with expected one
-        //           if offset is the expected one
-        //                save data
-        //                set offset = new_offset
-        //      else
-        //          delete SnapshotTransmission
-        //          set offset = 0
-        // if !done
-        //     request more with new offset
-        // else
-        //     install the received snapshot
-        //     remove SnapshotTransmission
+        self.handle_heartbeat(header.source).await;
+        
         let InstallSnapshotArgs {
             mut data,
             last_included_index,
