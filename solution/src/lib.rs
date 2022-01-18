@@ -1,8 +1,7 @@
 use async_channel::Sender;
 use std::collections::{HashMap, HashSet};
-use std::hash::Hash;
 use std::iter::repeat;
-use std::ops::{DerefMut, Range, RangeInclusive};
+use std::ops::RangeInclusive;
 use std::time::{Duration, SystemTime};
 
 use executor::{Handler, ModuleRef, System};
@@ -11,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::state_machine_manager::{
-    CommandOutput, StateMachineManager, StateMachineRequest, StateMachineResponse,
+    CommandOutput, SessionManagement, StateMachineManager, StateMachineRequest,
+    StateMachineResponse,
 };
 pub use domain::*;
 use timing::{ElectionTimeout, HeartbeatTimeout, Timer, VotingReluctanceTimeout};
@@ -20,11 +20,6 @@ mod domain;
 
 const STATE_KEYNAME: &str = "state";
 const SNAPSHOT_KEYNAME: &str = "snapshot";
-
-struct Init {
-    self_ref: ModuleRef<Raft>,
-    state_machine_ref: ModuleRef<StateMachineManager>,
-}
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct LogStamp(pub u64, pub usize);
@@ -84,7 +79,7 @@ mod timing {
         }
 
         pub fn reset_timer(&mut self, raft_ref: ModuleRef<Raft>, interval: Duration) {
-            // log::debug!("Timer set to {:?}", interval);
+            // log::debug!("Timer set to {:#?}", interval);
             self.timer_abort.store(true, Ordering::Relaxed);
             self.timer_abort = Arc::new(AtomicBool::new(false));
             tokio::spawn(Self::run_timer(
@@ -165,7 +160,7 @@ mod state_machine_manager {
             }
         }
 
-        pub struct SessionManagment {
+        pub struct SessionManagement {
             self_id: Uuid,
             session_expiration: Duration,
             // This nested HashMap is number of repeated requests awaiting for State Machine
@@ -174,7 +169,7 @@ mod state_machine_manager {
             // last_activities: BinaryHeap<Reverse<(SystemTime, Uuid)>>,
         }
 
-        impl SessionManagment {
+        impl SessionManagement {
             pub fn new(self_id: Uuid, session_expiration: Duration) -> Self {
                 Self {
                     self_id,
@@ -182,6 +177,10 @@ mod state_machine_manager {
                     sessions: Default::default(),
                     // last_activities: Default::default(),
                 }
+            }
+
+            pub fn init_from(&mut self, sessions: HashMap<Uuid, ClientSession>) {
+                self.sessions = sessions;
             }
 
             pub fn new_session(&mut self, client_id: Uuid, creation_time: SystemTime) {
@@ -197,7 +196,7 @@ mod state_machine_manager {
 
             pub fn save_response(&mut self, client_id: Uuid, sequence_id: u64, response: Vec<u8>) {
                 log::debug!(
-                    "{}: Saved response for retransmissions: {:?}",
+                    "{}: Saved response for retransmissions: {:#?}",
                     self.self_id,
                     response
                 );
@@ -213,6 +212,10 @@ mod state_machine_manager {
                     .map_or(Response::SessionExpired, |session| {
                         session.reuse_response(sequence_num)
                     })
+            }
+
+            pub fn share_sessions(&self) -> HashMap<Uuid, ClientSession> {
+                self.sessions.clone()
             }
 
             pub fn new_activity(
@@ -241,7 +244,7 @@ mod state_machine_manager {
                     .iter()
                     .filter_map(|(&client_id, session)| {
                         log::trace!(
-                            "Last activity ({:?}) + expiration ({:?}) < current_time ({:?}) ",
+                            "Last activity ({:#?}) + expiration ({:#?}) < current_time ({:#?}) ",
                             session.last_activity,
                             self.session_expiration,
                             current_time
@@ -287,17 +290,26 @@ mod state_machine_manager {
         }
     }
 
-    use crate::state_machine_manager::sessions::{Response, SessionManagment};
-    use crate::{ClientRequestResponse, LogEntry, LogEntryContent, Raft, StateMachine};
+    use crate::{
+        ClientRequestResponse, ClientSession, LogEntry, LogEntryContent, Raft, StateMachine,
+    };
     use async_channel::Sender;
     use executor::{Handler, ModuleRef};
-    use std::time::Duration;
+    use sessions::Response;
+    pub use sessions::SessionManagement;
+    use std::collections::{HashMap, HashSet};
     use uuid::Uuid;
 
     pub enum StateMachineRequest {
-        MakeSnapshot(Sender<ClientRequestResponse>),
-        LoadSnapshot(Vec<u8>),
-        Entry((usize, LogEntry)),
+        MakeSnapshot {
+            for_whom: Sender<ClientRequestResponse>,
+            config: HashSet<Uuid>,
+        },
+        LoadSnapshot {
+            state: Vec<u8>,
+            sessions: HashMap<Uuid, ClientSession>,
+        },
+        Entry(usize, LogEntry),
     }
 
     pub enum CommandOutput {
@@ -306,7 +318,12 @@ mod state_machine_manager {
     }
 
     pub enum StateMachineResponse {
-        Snapshot(Sender<ClientRequestResponse>, Option<Vec<u8>>),
+        Snapshot {
+            for_whom: Sender<ClientRequestResponse>,
+            snapshot: Option<Vec<u8>>,
+            config: HashSet<Uuid>,
+            client_sessions: HashMap<Uuid, ClientSession>,
+        },
         SnapshotLoaded,
         ClientRegistered {
             log_index: usize,
@@ -321,7 +338,8 @@ mod state_machine_manager {
     }
 
     pub struct StateMachineManager {
-        session_management: SessionManagment,
+        self_id: Uuid,
+        session_management: SessionManagement,
         state_machine: Box<dyn StateMachine>,
         raft_ref: ModuleRef<Raft>,
         has_something_to_snapshot: bool,
@@ -332,10 +350,11 @@ mod state_machine_manager {
             state_machine: Box<dyn StateMachine>,
             raft_ref: ModuleRef<Raft>,
             self_id: Uuid,
-            session_expiration: Duration,
+            session_management: SessionManagement,
         ) -> Self {
             Self {
-                session_management: SessionManagment::new(self_id, session_expiration),
+                self_id,
+                session_management,
                 state_machine,
                 raft_ref,
                 has_something_to_snapshot: true, // TODO: settle on initial value of this
@@ -347,26 +366,29 @@ mod state_machine_manager {
     impl Handler<StateMachineRequest> for StateMachineManager {
         async fn handle(&mut self, msg: StateMachineRequest) {
             match msg {
-                StateMachineRequest::MakeSnapshot(for_whom) => {
+                StateMachineRequest::MakeSnapshot { for_whom, config } => {
                     self.raft_ref
-                        .send(StateMachineResponse::Snapshot(
+                        .send(StateMachineResponse::Snapshot {
                             for_whom,
-                            if self.has_something_to_snapshot {
+                            snapshot: if self.has_something_to_snapshot {
                                 Some(self.state_machine.serialize().await)
                             } else {
                                 None
                             },
-                        ))
+                            config,
+                            client_sessions: self.session_management.share_sessions(),
+                        })
                         .await;
                     self.has_something_to_snapshot = false;
                 }
-                StateMachineRequest::LoadSnapshot(snapshot) => {
-                    self.state_machine.initialize(snapshot.as_slice()).await;
+                StateMachineRequest::LoadSnapshot{state, sessions} => {
+                    self.state_machine.initialize(state.as_slice()).await;
+                    self.session_management.init_from(sessions);
                     self.raft_ref
                         .send(StateMachineResponse::SnapshotLoaded)
                         .await;
                 }
-                StateMachineRequest::Entry((log_index, log_entry)) => match log_entry.content {
+                StateMachineRequest::Entry(log_index, log_entry) => match log_entry.content {
                     LogEntryContent::Command {
                         ref data,
                         client_id,
@@ -376,7 +398,7 @@ mod state_machine_manager {
                         self.has_something_to_snapshot = true;
                         self.session_management.expire_too_old(log_entry.timestamp);
 
-                        // log::debug!("{}: Applying {:?}", self.self_id, log_entry);
+                        // log::debug!("{}: Applying {:#?}", self.self_id, log_entry);
 
                         self.session_management.new_activity(
                             client_id,
@@ -391,7 +413,7 @@ mod state_machine_manager {
                         {
                             Response::NotYetApplied => {
                                 let output = self.state_machine.apply(data.as_slice()).await;
-                                log::debug!("State machine has applied another command.");
+                                log::debug!("{}: State machine has applied command {}.", self.self_id, log_index);
                                 CommandOutput::CommandApplied { data: output }
                             }
                             Response::AlreadyApplied(output) => {
@@ -414,7 +436,12 @@ mod state_machine_manager {
                         }
 
                         self.raft_ref
-                            .send(StateMachineResponse::CommandOutcome { log_index, client_id, sequence_num, output })
+                            .send(StateMachineResponse::CommandOutcome {
+                                log_index,
+                                client_id,
+                                sequence_num,
+                                output,
+                            })
                             .await;
                     }
                     LogEntryContent::Configuration { .. } => {
@@ -447,11 +474,13 @@ enum ProcessType {
     Leader {
         next_index: HashMap<Uuid, usize>,
         match_index: HashMap<Uuid, usize>,
+        snapshot_offset: HashMap<Uuid, usize>,
         heartbeat_timer: Timer<HeartbeatTimeout>,
         // This is for leader step-down if too few followers have responded during last election time
         responses_collected_during_this_election: HashSet<Uuid>,
         // Where the response should be sent after commiting key-th log entry
         client_senders: HashMap<usize, Sender<ClientRequestResponse>>,
+        cached_snapshot: Option<SnapshotData>,
     },
 }
 
@@ -466,21 +495,29 @@ impl ProcessType {
         }
     }
 
-    pub fn new_leader(servers: &HashSet<Uuid>, last_log_index: usize) -> Self {
+    pub fn new_leader(
+        servers: &HashSet<Uuid>,
+        last_log_index: usize,
+        snapshot_to_cache: Option<SnapshotData>,
+    ) -> Self {
         let match_index: HashMap<Uuid, usize> = servers.iter().cloned().zip(repeat(0)).collect();
         let next_index: HashMap<Uuid, usize> = servers
             .iter()
             .cloned()
             .zip(repeat(last_log_index + 1))
             .collect();
+        let snapshot_offset: HashMap<Uuid, usize> =
+            servers.iter().cloned().zip(repeat(0)).collect();
         let heartbeat_timer = Timer::<HeartbeatTimeout>::new();
 
         ProcessType::Leader {
             next_index,
             match_index,
+            snapshot_offset,
             heartbeat_timer,
             responses_collected_during_this_election: Default::default(),
             client_senders: Default::default(),
+            cached_snapshot: snapshot_to_cache,
         }
     }
 }
@@ -491,12 +528,11 @@ impl Default for ProcessType {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct Log {
     first_index: usize,
     entries: Vec<LogEntry>,
     prev_term: u64,
-    prev_config: HashSet<Uuid>,
 }
 
 impl Log {
@@ -511,7 +547,6 @@ impl Log {
                 timestamp,
             }],
             prev_term: 0,
-            prev_config: servers,
         }
     }
 
@@ -533,7 +568,11 @@ impl Log {
     }
 
     pub fn get(&self, i: usize) -> Option<&LogEntry> {
-        self.entries.get(i - self.first_index)
+        if self.first_index > i {
+            None
+        } else {
+            self.entries.get(i - self.first_index)
+        }
     }
 
     pub fn get_mut(&mut self, i: usize) -> Option<&mut LogEntry> {
@@ -561,19 +600,44 @@ impl Log {
     pub async fn save_snapshot(
         &mut self,
         stable_storage: &mut dyn StableStorage,
-        config: HashSet<Uuid>,
-        last_snapshotted_log_entry_index: usize,
-        snapshot: Vec<u8>,
+        snapshot: SnapshotData,
     ) {
+        let last_snapshotted_log_entry_index = snapshot.last_index;
         stable_storage
-            .put(SNAPSHOT_KEYNAME, snapshot.as_slice())
+            .put(
+                SNAPSHOT_KEYNAME,
+                bincode::serialize(&snapshot).unwrap().as_slice(),
+            )
             .await
             .unwrap();
-        self.prev_term = self.entries.last().unwrap().term;
-        self.entries
-            .drain(..=last_snapshotted_log_entry_index - self.first_index);
+        self.prev_term = snapshot.last_term;
+        self.entries.drain(
+            ..usize::min(
+                last_snapshotted_log_entry_index + 1 - self.first_index,
+                self.entries.len(),
+            ),
+        );
         self.first_index = last_snapshotted_log_entry_index + 1;
-        self.prev_config = config;
+    }
+
+    pub async fn get_snapshot_for_caching(
+        &self,
+        stable_storage: &mut dyn StableStorage,
+    ) -> Option<SnapshotData> {
+        if self.first_index > 0 {
+            Some(
+                bincode::deserialize(
+                    stable_storage
+                        .get(SNAPSHOT_KEYNAME)
+                        .await
+                        .unwrap()
+                        .as_slice(),
+                )
+                .unwrap(),
+            )
+        } else {
+            None
+        }
     }
 }
 
@@ -609,6 +673,7 @@ struct VolatileState {
     last_applied: usize,
     last_applied_acked: usize,
     voting_reluctant: bool,
+    snapshot_reception: Option<SnapshotReception>,
 }
 
 impl VolatileState {
@@ -619,8 +684,44 @@ impl VolatileState {
             last_applied: 0,
             last_applied_acked: 0,
             voting_reluctant: false,
+            snapshot_reception: None,
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct SnapshotData {
+    state: Vec<u8>,
+    client_sessions: HashMap<Uuid, ClientSession>,
+    config: HashSet<Uuid>,
+    last_index: usize,
+    last_term: u64,
+}
+
+struct SnapshotReception {
+    pub last_index: usize,
+    pub last_term: u64,
+    pub last_config: HashSet<Uuid>,
+    pub client_sessions: HashMap<Uuid, ClientSession>,
+    pub expected_offset: usize,
+    pub data: Vec<u8>,
+}
+
+impl From<SnapshotReception> for SnapshotData {
+    fn from(reception: SnapshotReception) -> Self {
+        Self {
+            state: reception.data,
+            client_sessions: reception.client_sessions,
+            config: reception.last_config,
+            last_index: reception.last_index,
+            last_term: reception.last_term,
+        }
+    }
+}
+
+struct Init {
+    self_ref: ModuleRef<Raft>,
+    state_machine_ref: ModuleRef<StateMachineManager>,
 }
 
 pub struct Raft {
@@ -660,19 +761,21 @@ impl Raft {
                 config.servers.clone(),
             ));
 
+        let mut session_management = SessionManagement::new(self_id, session_expiration);
+
         // Check if snapshot must be loaded
         if persistent_state.log.first_index != 0 {
-            config.servers = persistent_state.log.prev_config.clone();
-
-            state_machine
-                .initialize(
-                    stable_storage
-                        .get(SNAPSHOT_KEYNAME)
-                        .await
-                        .unwrap_or_else(|| panic!("Snapshot file not present while required!"))
-                        .as_slice(),
-                )
-                .await;
+            let snapshot: SnapshotData = bincode::deserialize(
+                stable_storage
+                    .get(SNAPSHOT_KEYNAME)
+                    .await
+                    .unwrap_or_else(|| panic!("Snapshot file not present while required!"))
+                    .as_slice(),
+            )
+            .unwrap();
+            state_machine.initialize(snapshot.state.as_slice()).await;
+            config.servers = snapshot.config;
+            session_management.init_from(snapshot.client_sessions);
         }
 
         let self_ref = system
@@ -697,7 +800,7 @@ impl Raft {
                 state_machine,
                 self_ref.clone(),
                 self_id,
-                session_expiration,
+                session_management,
             ))
             .await;
         self_ref
@@ -732,7 +835,7 @@ impl Raft {
 
     async fn send_msg_to(&self, target: &Uuid, content: RaftMessageContent) {
         log::trace!(
-            "{}: sending message to {}: {:?}!",
+            "{}: sending message to {}: {:#?}!",
             self.config.self_id,
             target,
             content
@@ -781,7 +884,7 @@ impl Raft {
     /// Common message processing.
     fn msg_received(&mut self, msg: &RaftMessage) {
         log::debug!(
-            "{}: received message from {}: {:?}!",
+            "{}: received message from {}: {:#?}!",
             self.config.self_id,
             msg.header.source,
             msg.content
@@ -817,56 +920,88 @@ impl Raft {
         }
     }
 
-    async fn replicate_log_to(&self, next_index: usize, server: Uuid) {
-        if self
-            .persistent_state
-            .log
-            .entry_already_snapshotted(next_index)
-        {
-            // InstallSnapshot
-            self.send_msg_to(
-                &server,
-                RaftMessageContent::InstallSnapshot(InstallSnapshotArgs {
-                    last_included_index: 0,
-                    last_included_term: 0,
-                    last_config: None,
-                    client_sessions: None,
-                    offset: 0,
-                    data: vec![],
-                    done: false,
-                }),
-            )
-            .await;
-        } else {
-            // AppendEntries
-            let prev_log_index = next_index - 1;
-            self.send_msg_to(
-                &server,
-                RaftMessageContent::AppendEntries(AppendEntriesArgs {
-                    prev_log_index,
-                    prev_log_term: self.persistent_state.log.get(prev_log_index).unwrap().term,
-                    entries: self.persistent_state.log.subvec(
-                        next_index
-                            ..=usize::min(
+    async fn replicate_log_to(
+        &self,
+        server: Uuid,
+    ) {
+        if let ProcessType::Leader {
+            ref next_index,
+            ref snapshot_offset,
+            ref cached_snapshot,
+            ..
+        } = self.volatile_state.process_type {
+            let snapshot_offset = snapshot_offset[&server];
+            let next_index = next_index[&server];
+
+            if self
+                .persistent_state
+                .log
+                .entry_already_snapshotted(next_index)
+            {
+                let (last_config, client_sessions) = if snapshot_offset == 0 {
+                    (
+                        Some(cached_snapshot.as_ref().unwrap().config.clone()),
+                        Some(cached_snapshot.as_ref().unwrap().client_sessions.clone()),
+                    )
+                } else {
+                    (None, None)
+                };
+                // InstallSnapshot
+                self.send_msg_to(
+                    &server,
+                    RaftMessageContent::InstallSnapshot(InstallSnapshotArgs {
+                        last_included_index: self.persistent_state.log.first_index - 1,
+                        last_included_term: self.persistent_state.log.prev_term,
+                        last_config,
+                        client_sessions,
+                        offset: snapshot_offset,
+                        data: cached_snapshot.as_ref().unwrap().state[snapshot_offset
+                            ..usize::min(
+                            snapshot_offset + self.config.snapshot_chunk_size,
+                            cached_snapshot.as_ref().unwrap().state.len(),
+                        )]
+                            .to_vec(),
+                        done: snapshot_offset + self.config.snapshot_chunk_size
+                            >= cached_snapshot.as_ref().unwrap().state.len(),
+                    }),
+                )
+                    .await;
+            } else {
+                // AppendEntries
+                let prev_log_index = next_index - 1;
+                self.send_msg_to(
+                    &server,
+                    RaftMessageContent::AppendEntries(AppendEntriesArgs {
+                        prev_log_index,
+                        prev_log_term: if prev_log_index + 1 == self.persistent_state.log.first_index {
+                            self.persistent_state.log.prev_term
+                        } else {
+                            self.persistent_state.log.get(prev_log_index).unwrap().term
+                        },
+                        entries: self.persistent_state.log.subvec(
+                            next_index
+                                ..=usize::min(
                                 self.persistent_state.log.last_index(),
                                 prev_log_index + self.config.append_entries_batch_size,
                             ),
-                    ),
-                    leader_commit: self.volatile_state.commit_index,
-                }),
-            )
-            .await;
+                        ),
+                        leader_commit: self.volatile_state.commit_index,
+                    }),
+                )
+                    .await;
+            }
         }
     }
 
-    async fn replicate_log(
-        &self,
-        match_index: &HashMap<Uuid, usize>,
-        next_index: &HashMap<Uuid, usize>,
-    ) {
-        log::debug!("{}: is replicating log!", self.config.self_id);
-        for server in match_index.keys().filter(|&x| *x != self.config.self_id) {
-            self.replicate_log_to(next_index[server], *server).await;
+    async fn replicate_log(&self) {
+        if let ProcessType::Leader {ref match_index, ..} = self.volatile_state.process_type {
+            log::debug!("{}: is replicating log!", self.config.self_id);
+            for server in match_index.keys().filter(|&x| *x != self.config.self_id) {
+                self.replicate_log_to(
+                    *server,
+                )
+                    .await;
+            }
         }
     }
 
@@ -878,6 +1013,10 @@ impl Raft {
             self.volatile_state.process_type = ProcessType::new_leader(
                 &self.config.servers,
                 self.persistent_state.log.last_index(),
+                self.persistent_state
+                    .log
+                    .get_snapshot_for_caching(&mut *self.stable_storage)
+                    .await,
             );
             self.persistent_state.leader_id = Some(self.config.self_id);
             self.persistent_state.voted_for = Some(self.config.self_id);
@@ -885,12 +1024,8 @@ impl Raft {
 
             match &self.volatile_state.process_type {
                 ProcessType::Follower | ProcessType::Candidate { .. } => unreachable!(),
-                ProcessType::Leader {
-                    match_index,
-                    next_index,
-                    ..
-                } => {
-                    self.replicate_log(match_index, next_index).await;
+                ProcessType::Leader { .. } => {
+                    self.replicate_log().await;
                 }
             };
             match &mut self.volatile_state.process_type {
@@ -918,7 +1053,7 @@ impl Raft {
                         > self.config.servers.len() / 2
                     {
                         log::info!(
-                            "{}: commited entry {}: {:?}.",
+                            "{}: commited entry {}: {:#?}.",
                             self.config.self_id,
                             i,
                             self.persistent_state.log.get(i).unwrap()
@@ -926,7 +1061,7 @@ impl Raft {
                         self.volatile_state.commit_index = i;
                     } else {
                         log::warn!(
-                            "{}: can't commit entry {}. ({:?})",
+                            "{}: can't commit entry {}. ({:#?})",
                             self.config.self_id,
                             i,
                             match_index
@@ -952,10 +1087,10 @@ impl Raft {
             self.state_machine_ref
                 .as_ref()
                 .unwrap()
-                .send(StateMachineRequest::Entry((
+                .send(StateMachineRequest::Entry(
                     currently_applied_idx,
                     newly_commited_entry.clone(),
-                )))
+                ))
                 .await;
         }
     }
@@ -1093,9 +1228,11 @@ impl Raft {
                 self.config.self_id
             );
             match self.volatile_state.process_type {
-                ProcessType::Leader { ref next_index, .. } => {
-                    self.replicate_log_to(next_index[&header.source], header.source)
-                        .await;
+                ProcessType::Leader { .. } => {
+                    self.replicate_log_to(
+                        header.source,
+                    )
+                    .await;
                 }
                 _ => unreachable!(),
             }
@@ -1165,24 +1302,149 @@ impl Raft {
         self.state_machine_ref
             .as_ref()
             .unwrap()
-            .send(StateMachineRequest::MakeSnapshot(for_whom))
+            .send(StateMachineRequest::MakeSnapshot {
+                for_whom,
+                config: self.config.servers.clone(), // TODO: last commited config
+            })
             .await;
     }
 
+    async fn install_snapshot(&mut self, snapshot: SnapshotData) {
+        self.persistent_state
+            .log
+            .save_snapshot(&mut *self.stable_storage, snapshot.clone())
+            .await;
+        self.state_machine_ref.as_ref().unwrap().send(
+            StateMachineRequest::LoadSnapshot{
+                state: snapshot.state,
+                sessions: snapshot.client_sessions
+            }
+        ).await;
+        self.volatile_state.last_applied = snapshot.last_index;
+
+        log::info!("{}: installed snapshot.", self.config.self_id);
+    }
+
     async fn handle_install_snapshot(
-        &self,
+        &mut self,
         header: RaftMessageHeader,
         content: InstallSnapshotArgs,
     ) {
-        todo!()
+        // if offset = 0
+        //      create new SnapshotTransmission instance and initialize it
+        //      set offset = new_offset
+        // else
+        //      if SnapshotTransmission exists and last_index is coherent with expected one
+        //           if offset is the expected one
+        //                save data
+        //                set offset = new_offset
+        //      else
+        //          delete SnapshotTransmission
+        //          set offset = 0
+        // if !done
+        //     request more with new offset
+        // else
+        //     install the received snapshot
+        //     remove SnapshotTransmission
+        let InstallSnapshotArgs {
+            mut data,
+            last_included_index,
+            last_included_term,
+            done,
+            last_config,
+            client_sessions,
+            offset,
+        } = content;
+
+        let data_len = data.len();
+        let expected_offset: usize = match self.volatile_state.snapshot_reception {
+            Some(ref mut reception) if reception.last_index == last_included_index => {
+                if reception.expected_offset == offset {
+                    let added_len = data_len;
+                    reception.data.append(&mut data);
+                    reception.expected_offset += added_len;
+                }
+                reception.expected_offset
+            }
+            _ if offset == 0 => {
+                self.volatile_state.snapshot_reception = Some(SnapshotReception {
+                    last_index: last_included_index,
+                    last_term: last_included_term,
+                    last_config: last_config.unwrap(),
+                    client_sessions: client_sessions.unwrap(),
+                    expected_offset: data_len,
+                    data,
+                });
+                data_len
+            }
+            _ => {
+                self.volatile_state.snapshot_reception = None;
+                0
+            }
+        };
+
+        self.send_msg_to(
+            &header.source,
+            RaftMessageContent::InstallSnapshotResponse(InstallSnapshotResponseArgs {
+                last_included_index,
+                offset: expected_offset,
+            }),
+        )
+            .await;
+        if done {
+            if let Some(reception) = self.volatile_state.snapshot_reception.take() {
+                let snapshot: SnapshotData =
+                    reception
+                    .into();
+                self.install_snapshot(snapshot).await;
+            }
+        }
     }
 
     async fn handle_install_snapshot_response(
-        &self,
+        &mut self,
         header: RaftMessageHeader,
         content: InstallSnapshotResponseArgs,
     ) {
-        todo!()
+        // ignore if not leader
+        // regard offset as acknum+1
+        // as the leader, hold next_offset[server_id] for each server
+        //
+
+        if let ProcessType::Leader {
+            ref mut snapshot_offset,
+            ref cached_snapshot,
+            ref mut next_index,
+            ..
+        } = self.volatile_state.process_type
+        {
+            match cached_snapshot {
+                Some(cached_snapshot)
+                    if content.last_included_index + 1 == self.persistent_state.log.first_index =>
+                {
+                    // snapshot is still valid
+                    if content.offset >= cached_snapshot.state.len() {
+                        // we must have already sent 'done', so no need to send anything; just transistion to AppendEntries
+                        *snapshot_offset.get_mut(&header.source).unwrap() = 0;
+                        *next_index.get_mut(&header.source).unwrap() =
+                            self.persistent_state.log.first_index;
+                        log::debug!("{}: Should go on to sending AppendEntries to {} now,\
+                         as next_index should have been incremented.", self.config.self_id, header.source)
+                    } else {
+                        // we need to send at least one chunk more.
+                        *snapshot_offset.get_mut(&header.source).unwrap() = content.offset;
+                    }
+                }
+                _ => {
+                    // snapshot is not valid anymore (or has never been if None), restart sending with the new one
+                    *snapshot_offset.get_mut(&header.source).unwrap() = 0;
+                }
+            }
+            self.replicate_log_to(
+                header.source,
+            )
+                .await;
+        }
     }
 }
 
@@ -1237,12 +1499,8 @@ impl Handler<HeartbeatTimeout> for Raft {
                 // ignore but notice and warn (stall info)
                 log::warn!("{}: received heartbeat timeout", self.config.self_id);
             }
-            ProcessType::Leader {
-                match_index,
-                next_index,
-                ..
-            } => {
-                self.replicate_log(match_index, next_index).await;
+            ProcessType::Leader { .. } => {
+                self.replicate_log().await;
                 self.try_commit(); // This is especially needed for single-node environments
                 self.try_apply().await;
             }
@@ -1329,6 +1587,8 @@ impl Handler<RaftMessage> for Raft {
                     self.handle_install_snapshot(msg.header, args).await;
                 } else {
                     // otherwise, regard this message as obsolete and reject it
+                    // The message returned has little sense regarding InstallSnapshot,
+                    // yet merely serves the purpose of propagating term change.
                     self.send_msg_to(
                         &msg.header.source,
                         RaftMessageContent::InstallSnapshotResponse(InstallSnapshotResponseArgs {
@@ -1337,9 +1597,7 @@ impl Handler<RaftMessage> for Raft {
                         }),
                     )
                     .await;
-                    // TODO: very strange. No message suitable for Rejected
                 }
-                todo!()
             }
 
             RaftMessageContent::InstallSnapshotResponse(args) => {
@@ -1347,7 +1605,6 @@ impl Handler<RaftMessage> for Raft {
                     self.handle_install_snapshot_response(msg.header, args)
                         .await;
                 } // otherwise, regard this message as obsolete and ignore it
-                todo!()
             }
         }
     }
@@ -1478,23 +1735,48 @@ impl Handler<ClientRequest> for Raft {
 impl Handler<StateMachineResponse> for Raft {
     async fn handle(&mut self, msg: StateMachineResponse) {
         match msg {
-            StateMachineResponse::Snapshot(for_whom, snapshot) => {
+            StateMachineResponse::Snapshot {
+                for_whom,
+                snapshot,
+                config,
+                client_sessions,
+            } => {
                 let response = ClientRequestResponse::SnapshotResponse(SnapshotResponseArgs {
                     content: match snapshot {
                         None => SnapshotResponseContent::NothingToSnapshot {
                             last_included_index: self.volatile_state.last_applied_acked,
                         },
                         Some(snapshot) => {
+                            let snapshot_data = SnapshotData {
+                                state: snapshot.clone(),
+                                client_sessions,
+                                config,
+                                last_index: self.volatile_state.last_applied_acked,
+                                last_term: self
+                                    .persistent_state
+                                    .log
+                                    .get(self.volatile_state.last_applied_acked)
+                                    .unwrap()
+                                    .term,
+                            };
+                            log::debug!(
+                                "{}: made snapshot: {:#?}",
+                                self.config.self_id,
+                                snapshot_data
+                            );
+
                             self.persistent_state
                                 .log
-                                .save_snapshot(
-                                    &mut *self.stable_storage,
-                                    self.config.servers.clone(),
-                                    self.volatile_state.last_applied_acked,
-                                    snapshot.clone(),
-                                )
+                                .save_snapshot(&mut *self.stable_storage, snapshot_data.clone())
                                 .await;
                             self.update_state().await;
+                            if let ProcessType::Leader {
+                                ref mut cached_snapshot,
+                                ..
+                            } = self.volatile_state.process_type
+                            {
+                                *cached_snapshot = Some(snapshot_data)
+                            }
                             SnapshotResponseContent::SnapshotCreated {
                                 last_included_index: self.volatile_state.commit_index,
                             }
@@ -1502,7 +1784,7 @@ impl Handler<StateMachineResponse> for Raft {
                     },
                 });
                 log::debug!(
-                    "{}: sent response to client: {:?}",
+                    "{}: sent response to client: {:#?}",
                     self.config.self_id,
                     response
                 );
@@ -1510,11 +1792,16 @@ impl Handler<StateMachineResponse> for Raft {
             }
 
             StateMachineResponse::SnapshotLoaded => {
-                unimplemented!()
+                // todo!()
             }
 
-            StateMachineResponse::CommandOutcome { log_index, output, client_id, sequence_num } => {
-                self.volatile_state.last_applied_acked += 1;
+            StateMachineResponse::CommandOutcome {
+                log_index,
+                output,
+                client_id,
+                sequence_num,
+            } => {
+                self.volatile_state.last_applied_acked = log_index;
                 if let ProcessType::Leader {
                     ref mut client_senders,
                     ..
@@ -1527,9 +1814,7 @@ impl Handler<StateMachineResponse> for Raft {
                                 sequence_num,
                                 content: match output {
                                     CommandOutput::CommandApplied { data } => {
-                                        CommandResponseContent::CommandApplied {
-                                            output: data,
-                                        }
+                                        CommandResponseContent::CommandApplied { output: data }
                                     }
                                     CommandOutput::SessionExpired => {
                                         CommandResponseContent::SessionExpired
@@ -1538,7 +1823,7 @@ impl Handler<StateMachineResponse> for Raft {
                             });
                         let _ = client.send(response.clone()).await;
                         log::debug!(
-                            "{}: sent response to client {}: {:?}",
+                            "{}: sent response to client {}: {:#?}",
                             self.config.self_id,
                             client_id,
                             response
@@ -1550,6 +1835,7 @@ impl Handler<StateMachineResponse> for Raft {
                 log_index,
                 client_id,
             } => {
+                self.volatile_state.last_applied_acked = log_index;
                 if let ProcessType::Leader {
                     ref mut client_senders,
                     ..
@@ -1564,7 +1850,7 @@ impl Handler<StateMachineResponse> for Raft {
                             },
                         );
                         log::debug!(
-                            "{}: sent response to client {}: {:?}",
+                            "{}: sent response to client {}: {:#?}",
                             self.config.self_id,
                             client_id,
                             response
