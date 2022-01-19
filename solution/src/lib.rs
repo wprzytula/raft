@@ -563,7 +563,7 @@ impl Log {
             self.entries
                 .last()
                 .map_or(self.prev_term, |log_entry| log_entry.term),
-            self.last_index() + 1,
+            self.last_index(),
         )
     }
 
