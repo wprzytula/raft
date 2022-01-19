@@ -381,7 +381,7 @@ mod state_machine_manager {
                         .await;
                     self.has_something_to_snapshot = false;
                 }
-                StateMachineRequest::LoadSnapshot{state, sessions} => {
+                StateMachineRequest::LoadSnapshot { state, sessions } => {
                     self.state_machine.initialize(state.as_slice()).await;
                     self.session_management.init_from(sessions);
                     self.raft_ref
@@ -413,7 +413,11 @@ mod state_machine_manager {
                         {
                             Response::NotYetApplied => {
                                 let output = self.state_machine.apply(data.as_slice()).await;
-                                log::debug!("{}: State machine has applied command {}.", self.self_id, log_index);
+                                log::debug!(
+                                    "{}: State machine has applied command {}.",
+                                    self.self_id,
+                                    log_index
+                                );
                                 CommandOutput::CommandApplied { data: output }
                             }
                             Response::AlreadyApplied(output) => {
@@ -643,7 +647,7 @@ impl Log {
 
 /// Persistent state of a Raft process.
 /// It shall be kept in stable storage, and updated before replying to messages.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct PersistentState {
     /// Number of the current term. `0` at boot.
     pub current_term: u64,
@@ -756,10 +760,14 @@ impl Raft {
             .get(STATE_KEYNAME)
             .await
             .map(|x| bincode::deserialize(x.as_slice()).unwrap())
-            .unwrap_or(PersistentState::new(
-                first_log_entry_timestamp,
-                config.servers.clone(),
-            ));
+            .unwrap_or_else(|| {
+                log::debug!("{}: Initializing with default state.", self_id);
+                PersistentState::new(
+                    first_log_entry_timestamp,
+                    config.servers.clone(),
+                )
+            });
+        log::debug!("{}: Initialized with state: {:#?}.", self_id, persistent_state);
 
         let mut session_management = SessionManagement::new(self_id, session_expiration);
 
@@ -834,7 +842,7 @@ impl Raft {
     }
 
     async fn send_msg_to(&self, target: &Uuid, content: RaftMessageContent) {
-        log::trace!(
+        log::debug!(
             "{}: sending message to {}: {:#?}!",
             self.config.self_id,
             target,
@@ -899,6 +907,7 @@ impl Raft {
         self.update_term(self.persistent_state.current_term + 1);
         log::info!("{}: turned into candidate.", self.config.self_id);
         self.volatile_state.process_type = ProcessType::new_candidate(&self.config.self_id);
+        self.persistent_state.voted_for = Some(self.config.self_id);
         self.update_state().await;
         self.try_become_leader(1).await;
 
@@ -920,16 +929,14 @@ impl Raft {
         }
     }
 
-    async fn replicate_log_to(
-        &self,
-        server: Uuid,
-    ) {
+    async fn replicate_log_to(&self, server: Uuid) {
         if let ProcessType::Leader {
             ref next_index,
             ref snapshot_offset,
             ref cached_snapshot,
             ..
-        } = self.volatile_state.process_type {
+        } = self.volatile_state.process_type
+        {
             let snapshot_offset = snapshot_offset[&server];
             let next_index = next_index[&server];
 
@@ -957,15 +964,15 @@ impl Raft {
                         offset: snapshot_offset,
                         data: cached_snapshot.as_ref().unwrap().state[snapshot_offset
                             ..usize::min(
-                            snapshot_offset + self.config.snapshot_chunk_size,
-                            cached_snapshot.as_ref().unwrap().state.len(),
-                        )]
+                                snapshot_offset + self.config.snapshot_chunk_size,
+                                cached_snapshot.as_ref().unwrap().state.len(),
+                            )]
                             .to_vec(),
                         done: snapshot_offset + self.config.snapshot_chunk_size
                             >= cached_snapshot.as_ref().unwrap().state.len(),
                     }),
                 )
-                    .await;
+                .await;
             } else {
                 // AppendEntries
                 let prev_log_index = next_index - 1;
@@ -973,7 +980,9 @@ impl Raft {
                     &server,
                     RaftMessageContent::AppendEntries(AppendEntriesArgs {
                         prev_log_index,
-                        prev_log_term: if prev_log_index + 1 == self.persistent_state.log.first_index {
+                        prev_log_term: if prev_log_index + 1
+                            == self.persistent_state.log.first_index
+                        {
                             self.persistent_state.log.prev_term
                         } else {
                             self.persistent_state.log.get(prev_log_index).unwrap().term
@@ -981,26 +990,26 @@ impl Raft {
                         entries: self.persistent_state.log.subvec(
                             next_index
                                 ..=usize::min(
-                                self.persistent_state.log.last_index(),
-                                prev_log_index + self.config.append_entries_batch_size,
-                            ),
+                                    self.persistent_state.log.last_index(),
+                                    prev_log_index + self.config.append_entries_batch_size,
+                                ),
                         ),
                         leader_commit: self.volatile_state.commit_index,
                     }),
                 )
-                    .await;
+                .await;
             }
         }
     }
 
     async fn replicate_log(&self) {
-        if let ProcessType::Leader {ref match_index, ..} = self.volatile_state.process_type {
+        if let ProcessType::Leader {
+            ref match_index, ..
+        } = self.volatile_state.process_type
+        {
             log::debug!("{}: is replicating log!", self.config.self_id);
             for server in match_index.keys().filter(|&x| *x != self.config.self_id) {
-                self.replicate_log_to(
-                    *server,
-                )
-                    .await;
+                self.replicate_log_to(*server).await;
             }
         }
     }
@@ -1009,6 +1018,11 @@ impl Raft {
         if votes_received > self.config.servers.len() / 2 {
             // become the leader
             log::info!("{}: was elected leader!", self.config.self_id);
+            log::debug!(
+                "{}: leader log: {:#?}!",
+                self.config.self_id,
+                self.persistent_state.log
+            );
 
             self.volatile_state.process_type = ProcessType::new_leader(
                 &self.config.servers,
@@ -1060,7 +1074,7 @@ impl Raft {
                         );
                         self.volatile_state.commit_index = i;
                     } else {
-                        log::warn!(
+                        log::trace!(
                             "{}: can't commit entry {}. ({:#?})",
                             self.config.self_id,
                             i,
@@ -1149,15 +1163,17 @@ impl Raft {
                             .unwrap() = content.entries[i].clone();
                         self.persistent_state
                             .log
-                            .truncate(first_new_entry_index + i);
+                            .truncate(first_new_entry_index + i + 1);
+                        log::trace!("{}: Bad log content has been truncated.", self.config.self_id);
                     }
                     None => {
                         // The rest of entries can be simply appended.
                         self.persistent_state
                             .log
                             .entries
-                            .extend_from_slice(&content.entries[i..]);
-                        break;
+                            .push(content.entries[i].clone())
+                            // .extend_from_slice(&content.entries[i..]);
+                        // break;
                     }
                 }
             }
@@ -1167,9 +1183,12 @@ impl Raft {
 
         self.update_state().await;
 
-        self.volatile_state.commit_index = usize::min(
-            content.leader_commit,
-            self.persistent_state.log.last_index(),
+        self.volatile_state.commit_index = usize::max(
+            self.volatile_state.commit_index,
+            usize::min(
+                content.leader_commit,
+                self.persistent_state.log.last_index(),
+            ),
         );
 
         // Respond to leader
@@ -1210,11 +1229,14 @@ impl Raft {
 
                     should_resend_append_entries
                 } else {
-                    if content.last_log_index < next_index[&header.source] {
-                        *next_index.get_mut(&header.source).unwrap() = content.last_log_index;
-                    } else {
-                        *next_index.get_mut(&header.source).unwrap() -= 1;
-                    }
+                    let next_index_copy = *next_index.get(&header.source).unwrap();
+                    *next_index.get_mut(&header.source).unwrap() =
+                        usize::min(content.last_log_index + 1, next_index_copy - 1);
+                    // if content.last_log_index < next_index[&header.source] {
+                    //     *next_index.get_mut(&header.source).unwrap() = content.last_log_index + 1;
+                    // } else {
+                    //     *next_index.get_mut(&header.source).unwrap() -= 1;
+                    // }
 
                     true
                 }
@@ -1229,10 +1251,7 @@ impl Raft {
             );
             match self.volatile_state.process_type {
                 ProcessType::Leader { .. } => {
-                    self.replicate_log_to(
-                        header.source,
-                    )
-                    .await;
+                    self.replicate_log_to(header.source).await;
                 }
                 _ => unreachable!(),
             }
@@ -1241,6 +1260,26 @@ impl Raft {
 
     async fn handle_request_vote(&mut self, header: RaftMessageHeader, content: RequestVoteArgs) {
         let candidate_id = header.source;
+
+        let vote_granted: bool = match self.volatile_state.process_type {
+            ProcessType::Follower => {
+                if (match self.persistent_state.voted_for {
+                    None => true,
+                    Some(voted_for) => voted_for == candidate_id,
+                }) && self.persistent_state.log.stamp()
+                    <= LogStamp(content.last_log_term, content.last_log_index)
+                {
+                    self.persistent_state.voted_for = Some(candidate_id);
+                    true
+                } else {
+                    false
+                }
+            }
+            ProcessType::Leader { .. } | ProcessType::Candidate { .. } => false,
+        };
+
+        self.update_state().await;
+
         self.message_sender
             .send(
                 &header.source,
@@ -1249,25 +1288,8 @@ impl Raft {
                         source: self.config.self_id,
                         term: self.persistent_state.current_term,
                     },
-                    content: RaftMessageContent::RequestVoteResponse(RequestVoteResponseArgs {
-                        vote_granted: match &self.volatile_state.process_type {
-                            ProcessType::Follower => {
-                                if (match self.persistent_state.voted_for {
-                                    None => true,
-                                    Some(voted_for) => voted_for == candidate_id,
-                                }) && self.persistent_state.log.stamp()
-                                    <= LogStamp(content.last_log_term, content.last_log_index)
-                                {
-                                    self.persistent_state.voted_for = Some(candidate_id);
-                                    true
-                                } else {
-                                    false
-                                }
-                            }
-                            ProcessType::Leader { .. } | ProcessType::Candidate { .. } => false,
-                        },
-                    }),
-                },
+                    content: RaftMessageContent::RequestVoteResponse(RequestVoteResponseArgs { vote_granted })
+                }
             )
             .await;
     }
@@ -1314,12 +1336,14 @@ impl Raft {
             .log
             .save_snapshot(&mut *self.stable_storage, snapshot.clone())
             .await;
-        self.state_machine_ref.as_ref().unwrap().send(
-            StateMachineRequest::LoadSnapshot{
+        self.state_machine_ref
+            .as_ref()
+            .unwrap()
+            .send(StateMachineRequest::LoadSnapshot {
                 state: snapshot.state,
-                sessions: snapshot.client_sessions
-            }
-        ).await;
+                sessions: snapshot.client_sessions,
+            })
+            .await;
         self.volatile_state.last_applied = snapshot.last_index;
 
         log::info!("{}: installed snapshot.", self.config.self_id);
@@ -1331,7 +1355,7 @@ impl Raft {
         content: InstallSnapshotArgs,
     ) {
         self.handle_heartbeat(header.source).await;
-        
+
         let InstallSnapshotArgs {
             mut data,
             last_included_index,
@@ -1376,12 +1400,10 @@ impl Raft {
                 offset: expected_offset,
             }),
         )
-            .await;
+        .await;
         if done {
             if let Some(reception) = self.volatile_state.snapshot_reception.take() {
-                let snapshot: SnapshotData =
-                    reception
-                    .into();
+                let snapshot: SnapshotData = reception.into();
                 self.install_snapshot(snapshot).await;
             }
         }
@@ -1414,8 +1436,12 @@ impl Raft {
                         *snapshot_offset.get_mut(&header.source).unwrap() = 0;
                         *next_index.get_mut(&header.source).unwrap() =
                             self.persistent_state.log.first_index;
-                        log::debug!("{}: Should go on to sending AppendEntries to {} now,\
-                         as next_index should have been incremented.", self.config.self_id, header.source)
+                        log::debug!(
+                            "{}: Should go on to sending AppendEntries to {} now,\
+                         as next_index should have been incremented.",
+                            self.config.self_id,
+                            header.source
+                        )
                     } else {
                         // we need to send at least one chunk more.
                         *snapshot_offset.get_mut(&header.source).unwrap() = content.offset;
@@ -1426,10 +1452,7 @@ impl Raft {
                     *snapshot_offset.get_mut(&header.source).unwrap() = 0;
                 }
             }
-            self.replicate_log_to(
-                header.source,
-            )
-                .await;
+            self.replicate_log_to(header.source).await;
         }
     }
 }
@@ -1447,7 +1470,7 @@ impl Handler<Init> for Raft {
 #[async_trait::async_trait]
 impl Handler<ElectionTimeout> for Raft {
     async fn handle(&mut self, _: ElectionTimeout) {
-        log::warn!("{}: received election timeout", self.config.self_id);
+        log::debug!("{}: received election timeout", self.config.self_id);
         match &mut self.volatile_state.process_type {
             ProcessType::Follower | ProcessType::Candidate { .. } => {
                 // (re)start being a candidate
@@ -1483,7 +1506,10 @@ impl Handler<HeartbeatTimeout> for Raft {
         match &self.volatile_state.process_type {
             ProcessType::Follower | ProcessType::Candidate { .. } => {
                 // ignore but notice and warn (stall info)
-                log::warn!("{}: received heartbeat timeout", self.config.self_id);
+                log::trace!(
+                    "{}: not being Leader, received heartbeat timeout",
+                    self.config.self_id
+                );
             }
             ProcessType::Leader { .. } => {
                 self.replicate_log().await;
@@ -1500,7 +1526,7 @@ impl Handler<VotingReluctanceTimeout> for Raft {
         if let ProcessType::Follower | ProcessType::Candidate { .. } =
             self.volatile_state.process_type
         {
-            log::warn!(
+            log::trace!(
                 "{}: received voting reluctance timeout",
                 self.config.self_id
             );
